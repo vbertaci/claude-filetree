@@ -57,8 +57,10 @@ import {
   rollUp,
   sameRepo,
 } from './git'
-import { type Paths, detectHome, detectPlatform, executable, paths as makePaths } from './os'
-import { layoutPane, renderPane, rootLabel } from './pane'
+import { AGE_TICK_MS, type ColumnMode, SIZE_JOBS, SIZE_LIMIT, columnOf, emptyColumns, modeOf, timeModeOf } from './columns'
+import { type GlyphOption, glyphOptionOf, glyphSetOf, hasNerdFont } from './icons'
+import { type Paths, detectHome, detectPlatform, executable, fontDirs, paths as makePaths } from './os'
+import { HEADER_IDS, type HeaderId, layoutPane, renderPane, rootLabel } from './pane'
 import { JUMP_LIMIT, PRUNE, REVEAL_LIMIT, WALK_DEPTH, WALK_LIMIT, filterOf, matches, parseFiles, termOf } from './search'
 import {
   type Effect,
@@ -88,6 +90,7 @@ const activityAtom = atom({ plugin: 'filetree-local', key: 'activity' }, emptyAc
 const gitAtom = atom({ plugin: 'filetree-local', key: 'git' }, emptyGit())
 const chipAtom = atom({ plugin: 'filetree-local', key: 'chip' }, null as GitChip | null)
 const searchAtom = atom({ plugin: 'filetree-local', key: 'search' }, { query: '' } as SearchState)
+const columnsAtom = atom({ plugin: 'filetree-local', key: 'columns' }, emptyColumns())
 
 /** What a shell call's scan compares against, taken before the call runs (R6.1). */
 type Snapshot = { since: number; generation: number; dirs: string[]; names: Map<string, Set<string>>; git: GitState }
@@ -120,6 +123,18 @@ let ticking = false
 let gitWatch: Timer | null = null
 /** The files of a root for the search; never in $.state, rebuilt on demand (spec-06 R2.1, R2.7). */
 let index: { root: string; ids: Promise<string[] | null> } | null = null
+let column: ColumnMode = 'date'
+let glyphOption: GlyphOption = 'auto'
+/** A Nerd Font in this machine's font folders, looked up once per load (spec-07 R4.2). */
+let nerdFont = false
+/** The header button under the pointer; '' for none (spec-07 R5.3). */
+let hovered = ''
+let ageTicker: Timer | null = null
+/** Folder sizes: the folders waiting, the keys being measured now, and the epoch that drops old results (spec-07 R3, G1). */
+let sizeQueue: string[] = []
+const sizing = new Set<string>()
+let sizeEpoch = 0
+let sizeActive = 0
 
 // A refused call reads "<plugin>: $.fs.list: EACCES: ..."; the person needs only the reason.
 const message = (err: unknown): string => (err instanceof Error ? err.message : String(err)).replace(/^[\w-]+: \$\.[\w.]+: /, '')
@@ -280,6 +295,133 @@ async function search($: EngineInterface, query: string) {
 }
 
 const focusSearch = ($: EngineInterface) => $.ui.focus({ requestId: PANE, key: 'q' }).catch(() => undefined)
+
+/** The bytes under a folder by $.fs.list alone; links are neither followed nor counted (spec-07 R3.2, R3.3). */
+async function measure($: EngineInterface, dir: string): Promise<number> {
+  let total = 0
+  let seen = 0
+  let level = [dir]
+  while (level.length > 0) {
+    const next: string[] = []
+    for (const d of level) {
+      let entries: FsEntry[]
+      try {
+        entries = await $.fs.list(paths.native(d))
+      } catch {
+        // The folder itself is unknown; a subfolder that cannot be listed is left out.
+        if (d === dir) return -1
+        continue
+      }
+      for (const entry of entries) {
+        if (++seen > SIZE_LIMIT) return -1
+        if (entry.isLink) continue
+        if (entry.kind === 'dir') next.push(paths.join(d, entry.name))
+        else if (entry.kind === 'file') total += entry.size
+      }
+    }
+    level = next
+  }
+  return total
+}
+
+/** Queues the folders not measured, queued or being measured; never waits, never writes (spec-07 R3.1, R3.6, G2). */
+function wantSizes($: EngineInterface, dirs: readonly string[]) {
+  for (const dir of dirs) {
+    const k = paths.key(dir)
+    if (!sizing.has(k) && !sizeQueue.some(q => paths.key(q) === k)) sizeQueue.push(dir)
+  }
+  pumpSizes($)
+}
+
+/** Up to SIZE_JOBS measures at a time; a result from before the last clear, or of another root, is dropped (R3.4, R3.5). */
+function pumpSizes($: EngineInterface) {
+  while (sizeActive < SIZE_JOBS && sizeQueue.length > 0) {
+    const dir = sizeQueue.shift()!
+    const k = paths.key(dir)
+    const epoch = sizeEpoch
+    sizing.add(k)
+    sizeActive += 1
+    void measure($, dir)
+      .then(async bytes => {
+        if (epoch !== sizeEpoch) return
+        const { root } = await read($, treeAtom)
+        if (!paths.inside(root, dir)) return
+        await update($, columnsAtom, c => {
+          if (epoch !== sizeEpoch) return c
+          return c.root === root ? { ...c, bytes: { ...c.bytes, [k]: bytes } } : { root, size: null, bytes: { [k]: bytes } }
+        })
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (epoch === sizeEpoch) sizing.delete(k)
+        sizeActive -= 1
+        pumpSizes($)
+      })
+  }
+}
+
+/** Drops every size and what is queued; measures still running finish into nothing. A new root also forgets Σ (R1.4, R3.5). */
+async function clearSizes($: EngineInterface, newRoot = false) {
+  sizeEpoch += 1
+  sizeQueue = []
+  sizing.clear()
+  await update($, columnsAtom, c => (newRoot ? emptyColumns() : { ...c, bytes: {} }))
+}
+
+/** Σ: size on or off for this root; sizes measured under another root are not kept (R1.3, R1.4). */
+async function toggleSize($: EngineInterface) {
+  const { root } = await read($, treeAtom)
+  await update($, columnsAtom, c => ({ root, size: modeOf(c, root, column) !== 'size', bytes: c.root === root ? c.bytes : {} }))
+}
+
+/** Whether a font folder of this machine holds a Nerd Font; a folder that cannot be listed holds none (R4.2). */
+async function detectNerdFont($: EngineInterface): Promise<boolean> {
+  for (const dir of await fontDirs($, paths)) {
+    const names = await $.fs.list(paths.native(dir)).then(
+      entries => entries.map(entry => entry.name),
+      () => [] as string[],
+    )
+    if (hasNerdFont(names)) return true
+  }
+  return false
+}
+
+/** What each header button does; its Client posts the press (spec-07 R5.3). */
+async function headerAction($: EngineInterface, id: HeaderId) {
+  switch (id) {
+    case 'up': {
+      const up = paths.parent((await read($, treeAtom)).root)
+      if (up !== null) await reroot($, up, { follow: false, open: false })
+      return
+    }
+    case 'cwd':
+      return reroot($, await cwd($), { follow: true, open: false })
+    case 'refresh':
+      await clearSizes($)
+      return refresh($)
+    case 'hidden':
+      return update($, treeAtom, cur => toggleHidden(paths, cur))
+    case 'size':
+      return toggleSize($)
+    case 'collapse':
+      return update($, treeAtom, cur => collapseAll(paths, cur))
+    case 'unselect':
+      return update($, treeAtom, cur => ({ ...cur, selected: '' }))
+  }
+}
+
+type ButtonMessage = { id: HeaderId; over: boolean } | { id: HeaderId; press: true }
+
+/** Shape check of what a header button posted: only `{ over }` or `{ press: true }`, from a known button (spec-07 R5.5). */
+function parseButton(element: string, data: unknown): ButtonMessage | undefined {
+  const id = HEADER_IDS.find(h => element === `button-${h}`)
+  if (id === undefined || typeof data !== 'object' || data === null || Array.isArray(data)) return undefined
+  const m = data as Record<string, unknown>
+  if (Object.keys(m).length !== 1) return undefined
+  if (typeof m.over === 'boolean') return { id, over: m.over }
+  if (m.press === true) return { id, press: true }
+  return undefined
+}
 
 /** Whether the pane draws now (spec-05 R1.4, R2.5). */
 async function paneVisible($: EngineInterface): Promise<boolean> {
@@ -594,10 +736,12 @@ async function observe($: EngineInterface, e: ToolCallInput, result: ToolCallRes
     if (settings.writes) await reveal($, touch.ids, 'write')
     else await relistParents($, touch.ids)
     dropIndex()
+    await clearSizes($)
     void refreshGit($).catch(() => undefined)
   } else if (before) {
     await shellActivity($, before, result)
     dropIndex()
+    await clearSizes($)
   }
 }
 
@@ -616,6 +760,7 @@ async function reroot($: EngineInterface, root: string, opts: { follow: boolean;
   const expanded = ((await read($, memoryAtom))[paths.key(root)] ?? []).map(rel => paths.join(root, rel))
   await update($, treeAtom, t => ({ ...emptyTree(root, t.showHidden), follow: opts.follow, generation: t.generation + 1, expanded }))
   dropIndex()
+  await clearSizes($, true)
   await showPane($, opts)
   await loadInDepthOrder($, expanded)
   await refreshGit($)
@@ -735,10 +880,13 @@ export const register: Register = (on, options) => {
   settings = settingsOf(options)
   hints = options.hints !== 'off'
   refreshMs = refreshMsOf(options)
+  column = columnOf(options)
+  glyphOption = glyphOptionOf(options)
 
   on('session.start', async ($, e, next) => {
     paths = makePaths(await detectPlatform($))
     home = await detectHome($, paths)
+    nerdFont = glyphOption === 'auto' && (await detectNerdFont($))
     await $.command.register({
       name: 'filetree',
       description: 'Show the file tree; args: [path] (no path = follow the cwd)',
@@ -777,6 +925,9 @@ export const register: Register = (on, options) => {
     ticker = null
     const ms = refreshMs
     if (ms !== null) ticker = $.clock.every(ms, () => void tick($).catch(() => undefined))
+    // Ages move on with the clock alone: a redraw each minute (spec-07 R1.5).
+    ageTicker?.cancel()
+    ageTicker = column === 'age' ? $.clock.every(AGE_TICK_MS, () => $.ui.invalidate('ui.render')) : null
     return next(e)
   })
 
@@ -816,21 +967,17 @@ export const register: Register = (on, options) => {
     const chip = c !== null && c.root === t.root && now - c.at < CHIP_MS ? c : null
     const { query } = await read($, searchAtom)
     const keep = filterOf(paths, t, termOf(query))
-    const layout = layoutPane(t, { surface: e.surface, bodyColumns: e.props.bodyColumns, bodyRows: e.props.scroll.bodyRows }, glow, git, paths, chip, keep)
+    const cs = await read($, columnsAtom)
+    const mode = modeOf(cs, t.root, column)
+    const glyphs = glyphSetOf(glyphOption, nerdFont, e.surface)
+    const look = { mode, bytes: cs.root === t.root ? cs.bytes : {}, glyphs, now }
+    const layout = layoutPane(t, { surface: e.surface, bodyColumns: e.props.bodyColumns, bodyRows: e.props.scroll.bodyRows }, glow, git, paths, chip, keep, look)
     view = { from: layout.from, max: layout.max }
+    if (layout.sizeWanted.length > 0) wantSizes($, layout.sizeWanted)
     // The focus goes back to `open` after a nav button; a ring that cannot move is no failure.
     const nav = (k: KeyInput['key']) =>
       key($, { key: k }, e.surface).then(() => $.ui.focus({ requestId: PANE, key: 'nav-o' }).catch(() => undefined))
-    return renderPane($, e, paths, t, layout, git, glow, chip, query, {
-      up: async () => {
-        const up = paths.parent(t.root)
-        if (up !== null) await reroot($, up, { follow: false, open: false })
-      },
-      cwd: async () => reroot($, await cwd($), { follow: true, open: false }),
-      refresh: () => refresh($),
-      hidden: () => update($, treeAtom, cur => toggleHidden(paths, cur)),
-      collapse: () => update($, treeAtom, cur => collapseAll(paths, cur)),
-      unselect: () => update($, treeAtom, cur => ({ ...cur, selected: '' })),
+    return renderPane($, e, paths, t, layout, git, glow, chip, query, { glyphs, mode, timeMode: timeModeOf(column), hovered }, {
       nav,
       search: value => search($, value),
       jump: value => jump($, value),
@@ -840,6 +987,17 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.message', { requestId: PANE }, async ($, e, next) => {
+    if (typeof e.element === 'string' && e.element.startsWith('button-')) {
+      const msg = parseButton(e.element, e.data)
+      if (!msg) return {}
+      if ('press' in msg) await headerAction($, msg.id)
+      else {
+        const was = hovered
+        hovered = msg.over ? msg.id : hovered === msg.id ? '' : hovered
+        if (hovered !== was) $.ui.invalidate('ui.render')
+      }
+      return {}
+    }
     if (e.element !== 'rows') return next(e)
     const t = await read($, treeAtom)
     const msg = parseMessage(e.data, new Set(t.nodes.map(n => n.id)))

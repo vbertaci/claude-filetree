@@ -5,8 +5,11 @@ import type { RowsMessage, RowsProps, Seg } from '../types'
 // Draws the rows it is handed and posts what the person does. No decisions here:
 // the hooks module owns the tree, the layout and what each key or click means.
 
-/** `ref` is mutated in place, so the timer reads what the latest props say without a redraw. */
-type Local = { phase: number; ref: { glowing: boolean } }
+/**
+ * `ref` is mutated in place, so the timer reads what the latest props say without a redraw.
+ * `hover` is the row under a resting pointer, -1 for none; it never leaves the Client (spec-07 R6.4).
+ */
+type Local = { phase: number; hover: number; ref: { glowing: boolean } }
 
 const GLOW_TICK_MS = 90
 
@@ -27,7 +30,7 @@ const Rows: ClientModule<RowsProps, Local> = (props, surface) => {
 
   let local = surface.state
   if (local === undefined) {
-    local = { phase: 0, ref: { glowing: false } }
+    local = { phase: 0, hover: -1, ref: { glowing: false } }
     surface.setState(local)
     // One timer for the instance's life; it redraws only while a row glows (R5.5).
     surface.every(GLOW_TICK_MS, () => {
@@ -37,11 +40,21 @@ const Rows: ClientModule<RowsProps, Local> = (props, surface) => {
   }
   local.ref.glowing = props.rows.some(r => r.segs.some(s => s.glow))
   const phase = local.phase
+  const hover = local.hover
   const onBar = (e: ClientPointerEvent) => props.bar !== null && e.x >= surface.columns - 1
 
   surface.onKey(e => post({ kind: 'key', key: e.key, ...(e.ctrl ? { ctrl: true } : {}), ...(e.shift ? { shift: true } : {}) }))
+  const hoverAt = (y: number) => {
+    const now = surface.state
+    if (now && now.hover !== y) surface.setState({ ...now, hover: y })
+  }
   surface.onPointer(e => {
-    const scrollTo = () => post({ kind: 'scrollTo', fraction: Math.max(0, Math.min(1, e.y / Math.max(1, props.rows.length - 1))) })
+    const scrollTo = () => {
+      hoverAt(-1)
+      post({ kind: 'scrollTo', fraction: Math.max(0, Math.min(1, e.y / Math.max(1, props.rows.length - 1))) })
+    }
+    if (e.type === 'leave') return hoverAt(-1)
+    if (e.type === 'move' && e.button === undefined) return hoverAt(e.y >= 0 && e.y < props.rows.length ? e.y : -1)
     if (e.type === 'move' && e.button === 'left' && onBar(e)) return scrollTo()
     if (e.type !== 'down' || (e.button !== 'left' && e.button !== 'right')) return
     if (e.button === 'left' && onBar(e)) return scrollTo()
@@ -74,7 +87,7 @@ const Rows: ClientModule<RowsProps, Local> = (props, surface) => {
   return (
     <Box flexDirection="column">
       {props.rows.map((row, y) => (
-        <Box flexDirection="row">
+        <Box flexDirection="row" {...(y === hover && !row.active ? { backgroundColor: 'subtle' as const } : {})}>
           {row.segs.flatMap(seg => (seg.glow ? glowing(seg, row.active) : [plain(seg, row.active)]))}
           {bar !== null &&
             (y >= bar.thumbFrom && y < bar.thumbFrom + bar.thumbSize ? (

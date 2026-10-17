@@ -1,6 +1,6 @@
 {
   "name": "filetree-local",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "IDE-style file tree pane for Claude Code, local build",
   "author": { "name": "w4rl0ck" },
   "types": "./types/index.d.ts",
@@ -39,6 +39,20 @@
       "description": "on: outside a git repo, a line under the header says git status starts after git init. off: the line is hidden and the tree gets the row.",
       "default": "on",
       "options": ["on", "off"]
+    },
+    "column": {
+      "type": "string",
+      "title": "Right column",
+      "description": "What the right column shows by default: date (last modified), age (time since last modified: now, 12m, 3h, 5d, then Oct 9, then the year) or size (files in bytes, folders as the total under them, measured in the background). The Σ button switches between size and the date or age.",
+      "default": "date",
+      "options": ["date", "age", "size"]
+    },
+    "glyphs": {
+      "type": "string",
+      "title": "Icons",
+      "description": "auto: Nerd Font icons in the terminal when a Nerd Font is installed on this machine; plain everywhere else. nerd: always Nerd Font icons. plain: Unicode only.",
+      "default": "auto",
+      "options": ["auto", "nerd", "plain"]
     }
   }
 }

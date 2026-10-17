@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { paths } from '../hooks/os'
+import { fontDirs, paths } from '../hooks/os'
 
 const win = paths('windows')
 const posix = paths('posix')
@@ -75,5 +75,23 @@ describe('Paths on posix', () => {
     expect(posix.parent('/a')).toBe('/')
     expect(posix.parent('/')).toBe(null)
     expect(posix.native('/a/b')).toBe('/a/b')
+  })
+})
+
+describe('fontDirs (spec-07 R4.2)', () => {
+  const env = (vars: Record<string, string>) => ({ env: { get: async (name: string) => vars[name] } }) as any
+
+  test('on Windows the font folders of the machine and of the person, each only when its variable is set', async () => {
+    const both = env({ WINDIR: 'C:\\Windows', LOCALAPPDATA: 'C:\\Users\\w4rl0ck\\AppData\\Local' })
+    expect(await fontDirs(both, win)).toEqual(['C:/Windows/Fonts', 'C:/Users/w4rl0ck/AppData/Local/Microsoft/Windows/Fonts'])
+    expect(await fontDirs(env({ WINDIR: 'C:\\Windows' }), win)).toEqual(['C:/Windows/Fonts'])
+    expect(await fontDirs(env({}), win)).toEqual([])
+  })
+
+  test('none on posix, without reading a variable', async () => {
+    const read: string[] = []
+    const $ = { env: { get: async (name: string) => (read.push(name), '/x') } } as any
+    expect(await fontDirs($, posix)).toEqual([])
+    expect(read).toEqual([])
   })
 })

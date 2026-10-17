@@ -38,6 +38,7 @@ const node = (id: string, kind: FileNode['kind'] = 'file'): FileNode => ({
   kind,
   hidden: false,
   mtimeMs: 0,
+  size: 0,
   loaded: kind === 'dir',
 })
 

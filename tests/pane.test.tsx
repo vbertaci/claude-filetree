@@ -6,7 +6,8 @@ import { register } from '../hooks/register'
 
 // A fake Windows machine beneath the plugin: folders by norm path, each a map of name to kind.
 
-type Kind = 'file' | 'dir' | 'link'
+/** 'dir-link' is a link to a folder: kind dir, isLink true. */
+type Kind = 'file' | 'dir' | 'link' | 'dir-link'
 type World = {
   cwd: string
   dirs: Record<string, Record<string, Kind>>
@@ -26,6 +27,10 @@ type World = {
   gitDelays?: Record<string, number[]>
   /** The pane waits undrawn: open but not placed. */
   unplaced?: boolean
+  /** Bytes by norm path of an entry; default 1. */
+  sizes?: Record<string, number>
+  /** Environment variables besides OS and USERPROFILE. */
+  env?: Record<string, string>
 }
 /** A string is stdout with exit 0; 'reject' is a git that cannot start. */
 type GitAnswer = string | { exitCode: number; stdout?: string } | 'reject'
@@ -39,7 +44,7 @@ const MTIME = 1_700_000_000_000
 function world(on: On, w: World) {
   const log: Log = { opens: [], closes: [], toasts: [], copies: [], lists: [], calls: [], runs: [], stats: [] }
   const open = new Set<string>()
-  mock.env(on, { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\w4rl0ck' })
+  mock.env(on, { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\w4rl0ck', ...w.env })
   const clock = mock.clock(on, { now: w.now ?? 1_000_000 })
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }) as any)
   on('session.cwd', () => ({ value: w.cwd.replace(/\//g, '\\') }) as any)
@@ -79,9 +84,9 @@ function world(on: On, w: World) {
     if (!dir) return { deny: `ENOENT: no such file or directory, scandir '${e.path}'` } as any
     const value = Object.entries(dir).map(([name, kind]) => ({
       name,
-      kind: kind === 'link' ? 'other' : kind,
-      isLink: kind === 'link',
-      size: 1,
+      kind: kind === 'link' ? 'other' : kind === 'dir-link' ? 'dir' : kind,
+      isLink: kind === 'link' || kind === 'dir-link',
+      size: w.sizes?.[`${p}/${name}`] ?? 1,
       mtimeMs: kind === 'file' ? (w.mtimes?.[`${p}/${name}`] ?? MTIME) : 0,
     }))
     const delay = w.delays?.[p]?.shift()
@@ -124,6 +129,8 @@ const run = ($: any, args: string, presentation: { isFullscreen: boolean; column
 const mount = ($: any, surface: 'terminal' | 'desktop' = 'terminal', props = pane()) =>
   $.ui.mount({ plugin: PLUGIN, surface, component: 'Pane', requestId: 'filetree', props, viewport: VIEWPORT })
 const rowsOf = async (ui: any): Promise<RowsProps> => (await ui.find({ type: 'Client', key: 'rows' })).props.props as RowsProps
+/** A header button, drawn inside its own Client (spec-07 R5.1). */
+const header = (ui: any, id: string) => ui.find({ type: 'Button', key: id, in: `button-${id}` })
 const raw = async (ui: any) => (await rowsOf(ui)).rows.map(r => r.segs.map(s => s.text).join(''))
 /** Each row's text without indentation, padding or the date column. */
 const names = async (ui: any) => (await raw(ui)).map(r => r.replace(/\s+\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/, '').trim())
@@ -238,7 +245,7 @@ describe('tree and drawing (R3, R4)', () => {
       const ui = await mount($, surface)
       const rows = await names(ui)
       expect(rows).toEqual(['▸ ■ .git', '▸ ■ node_modules', '▸ ■ src', '· b.md', '↪ link'])
-      expect(await ui.find({ type: 'Button', key: 'hidden' })).toBeDefined()
+      expect(await header(ui, 'hidden')).toBeDefined()
       await ui.unmount()
     }
   })
@@ -269,7 +276,7 @@ describe('tree and drawing (R3, R4)', () => {
     const { log } = world(on, w)
     await start($)
     const ui = await mount($)
-    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' })
+    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' }, { in: 'rows' })
     expect((await names(ui)).find(r => r.includes('src'))).toContain('src (unreadable)')
     await ui.press({ key: 'refresh' })
     expect(log.toasts.filter(t => t.startsWith('could not list'))).toEqual([expect.stringContaining('could not list C:\\p\\src: EACCES')])
@@ -279,7 +286,7 @@ describe('tree and drawing (R3, R4)', () => {
     world(on, PROJECT())
     await start($)
     const ui = await mount($)
-    await ui.post({ kind: 'press', id: 'C:/p/b.md', button: 'left' })
+    await ui.post({ kind: 'press', id: 'C:/p/b.md', button: 'left' }, { in: 'rows' })
     const row = (await rowsOf(ui)).rows.find(r => r.id === 'C:/p/b.md')!
     expect(row.active).toBe(true)
     expect(row.segs.find(s => s.text.startsWith('b.md'))?.bold).toBe(true)
@@ -308,7 +315,7 @@ describe('scrolling (R5)', () => {
     props = await rowsOf(ui)
     expect(props.rows[0]?.id).toBe('C:/m/f0003.txt')
 
-    await ui.post({ kind: 'scrollTo', fraction: 0.5 })
+    await ui.post({ kind: 'scrollTo', fraction: 0.5 }, { in: 'rows' })
     expect((await rowsOf(ui)).rows[0]?.id).toBe('C:/m/f0041.txt')
 
     await ui.key({ key: 'j', in: 'rows' })
@@ -350,8 +357,8 @@ describe('memory, refresh and follow (R6, R7, R8)', () => {
     const { log } = world(on, PROJECT())
     await start($)
     const ui = await mount($)
-    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' })
-    await ui.post({ kind: 'press', id: 'C:/p/src/lib', button: 'left' })
+    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' }, { in: 'rows' })
+    await ui.post({ kind: 'press', id: 'C:/p/src/lib', button: 'left' }, { in: 'rows' })
     await run($, 'C:\\q')
     expect(await names(ui)).toEqual(['· q.txt'])
     log.lists.length = 0
@@ -365,7 +372,7 @@ describe('memory, refresh and follow (R6, R7, R8)', () => {
     world(on, w)
     await start($)
     const ui = await mount($)
-    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' })
+    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' }, { in: 'rows' })
     await run($, 'C:\\q')
     delete w.dirs[ROOT]!.src
     await run($, '')
@@ -377,8 +384,8 @@ describe('memory, refresh and follow (R6, R7, R8)', () => {
     const { log } = world(on, w)
     await start($)
     const ui = await mount($)
-    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' })
-    await ui.post({ kind: 'press', id: 'C:/p/src/a.ts', button: 'left' })
+    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' }, { in: 'rows' })
+    await ui.post({ kind: 'press', id: 'C:/p/src/a.ts', button: 'left' }, { in: 'rows' })
     delete w.dirs['C:/p/src']!['a.ts']
     log.lists.length = 0
     await run($, '')
@@ -409,10 +416,10 @@ describe('memory, refresh and follow (R6, R7, R8)', () => {
     await $.classic.CwdChanged({ old_cwd: 'C:\\p', new_cwd: 'C:\\q' } as any)
     expect(await names(ui)).toEqual(['· q.txt'])
     expect(log.opens.at(-1).title).toBe('Files: q')
-    expect((await ui.find({ type: 'Button', key: 'cwd' }))?.props.dimColor).toBe(undefined)
+    expect((await header(ui, 'cwd'))?.props.dimColor).toBe(undefined)
 
     await run($, 'C:\\p')
-    expect((await ui.find({ type: 'Button', key: 'cwd' }))?.props.dimColor).toBe(true)
+    expect((await header(ui, 'cwd'))?.props.dimColor).toBe(true)
     await $.classic.CwdChanged({ old_cwd: 'C:\\q', new_cwd: 'C:\\' } as any)
     expect((await names(ui)).some(r => r.includes('b.md'))).toBe(true)
   })
@@ -431,7 +438,7 @@ describe('memory, refresh and follow (R6, R7, R8)', () => {
     const { clock } = world(on, w)
     await start($)
     const ui = await mount($)
-    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' })
+    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' }, { in: 'rows' })
     w.delays = { 'C:/p/src': [100] }
     void ui.press({ key: 'refresh' })
     await clock.settle()
@@ -450,7 +457,7 @@ describe('memory, refresh and follow (R6, R7, R8)', () => {
     const { clock } = world(on, w)
     await start($)
     const ui = await mount($)
-    void ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' })
+    void ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' }, { in: 'rows' })
     await clock.settle()
     await run($, 'C:\\q')
     await clock.advance(100)
@@ -491,9 +498,9 @@ describe('input (R9)', () => {
     const { log } = world(on, w)
     await start($)
     const ui = await mount($)
-    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' })
-    await ui.post({ kind: 'press', id: 'C:/p/src/a.ts', button: 'right' })
-    await ui.post({ kind: 'press', id: 'C:/p/src/a.ts', button: 'right', shift: true })
+    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' }, { in: 'rows' })
+    await ui.post({ kind: 'press', id: 'C:/p/src/a.ts', button: 'right' }, { in: 'rows' })
+    await ui.post({ kind: 'press', id: 'C:/p/src/a.ts', button: 'right', shift: true }, { in: 'rows' })
     expect(log.copies).toEqual(['src\\a.ts', 'C:\\p\\src\\a.ts'])
     expect(log.toasts).toEqual(['Copied src\\a.ts', 'Copied C:\\p\\src\\a.ts'])
     w.copyFails = true
@@ -541,8 +548,8 @@ describe('input (R9)', () => {
     await ui.press({ key: 'hidden' })
     expect((await names(ui)).some(r => r.includes('.git'))).toBe(false)
     await ui.press({ key: 'hidden' })
-    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' })
-    await ui.post({ kind: 'press', id: 'C:/p/src/a.ts', button: 'left' })
+    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' }, { in: 'rows' })
+    await ui.post({ kind: 'press', id: 'C:/p/src/a.ts', button: 'left' }, { in: 'rows' })
     await ui.press({ key: 'collapse' })
     expect((await rowsOf(ui)).rows.find(r => r.active)?.id).toBe('C:/p/src')
     expect((await names(ui)).some(r => r.includes('a.ts'))).toBe(false)
@@ -557,10 +564,10 @@ describe('input (R9)', () => {
     await start($)
     const ui = await mount($)
     const before = JSON.stringify(await rowsOf(ui))
-    await ui.post({ kind: 'press', id: 'C:/elsewhere', button: 'left' })
-    await ui.post({ kind: 'scrollTo', fraction: 2 })
-    await ui.post({ kind: 'nope' })
-    await ui.post('text')
+    await ui.post({ kind: 'press', id: 'C:/elsewhere', button: 'left' }, { in: 'rows' })
+    await ui.post({ kind: 'scrollTo', fraction: 2 }, { in: 'rows' })
+    await ui.post({ kind: 'nope' }, { in: 'rows' })
+    await ui.post('text', { in: 'rows' })
     expect(JSON.stringify(await rowsOf(ui))).toBe(before)
   })
 })
@@ -608,7 +615,7 @@ function direct(state: Record<string, unknown> = {}, extra: Record<string, any> 
   const $ = new Proxy(nouns, { get: (t, noun: string) => t[noun] ?? noop })
   return { hooks, $, state }
 }
-const pressOpen = (ui: any, id: string) => ui.post({ kind: 'press', id, button: 'left' })
+const pressOpen = (ui: any, id: string) => ui.post({ kind: 'press', id, button: 'left' }, { in: 'rows' })
 
 describe('observing tool calls (spec-02 R1, R2)', () => {
   test('the hook hands on the same e and returns the same result (G1)', async () => {
@@ -1124,8 +1131,8 @@ describe('git on the rows (spec-03 R3, R5)', () => {
     world(on, REPO())
     await start($)
     const ui = await mount($)
-    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' })
-    await ui.post({ kind: 'press', id: 'C:/p/src/lib', button: 'left' })
+    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' }, { in: 'rows' })
+    await ui.post({ kind: 'press', id: 'C:/p/src/lib', button: 'left' }, { in: 'rows' })
     expect((await rowOf(ui, 'C:/p/src/lib/x.ts')).segs.at(-1)).toEqual({ text: ' ?', color: 'success', bold: true })
   })
 
@@ -2166,5 +2173,341 @@ describe('where the focus goes (spec-06 R1.2, R4.2, R4.3), through the hooks', (
     expect(focuses).toEqual(['nav-o'])
     await findKey(await draw(), 'q').props.onSubmit('')
     expect(focuses).toEqual(['nav-o'])
+  })
+})
+
+// ---- spec-07: columns and look ----
+
+const FONTS = 'C:/Windows/Fonts'
+const MY_FONTS = 'C:/Users/w4rl0ck/AppData/Local/Microsoft/Windows/Fonts'
+const FONT_ENV = { WINDIR: 'C:\\Windows', LOCALAPPDATA: 'C:\\Users\\w4rl0ck\\AppData\\Local' }
+const DATE_END = /\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/
+/** A row as the Client draws it, segments joined. */
+const rowText = async (ui: any, id: string) => (await rowOf(ui, id)).segs.map(s => s.text).join('')
+const icon = (n: number) => String.fromCodePoint(n)
+/** Columns a drawn row takes, one per code point (R4.7). */
+const width = (text: string) => [...text].length
+/** The rows Client's drawn row boxes, top to bottom. */
+const rowBoxes = async (ui: any): Promise<any[]> => {
+  const drawn: any = await ui.drawn({ in: 'rows' })
+  return drawn.children.filter((c: any) => c?.type === 'Box')
+}
+
+describe('the right column (spec-07 R1, R2)', () => {
+  test('Σ switches to sizes and back, lights while on, and a reroot brings the option back', async ($, on) => {
+    world(on, PROJECT())
+    await start($)
+    const ui = await mount($)
+    expect((await header(ui, 'size'))?.props.dimColor).toBe(true)
+    expect(await rowText(ui, 'C:/p/b.md')).toMatch(DATE_END)
+
+    await ui.press({ key: 'size' })
+    expect((await header(ui, 'size'))?.props.dimColor).toBe(undefined)
+    expect(await rowText(ui, 'C:/p/b.md')).toMatch(/b\.md {2,}1 B$/)
+    expect((await rowText(ui, 'C:/p/b.md')).endsWith('     1 B')).toBe(true)
+    expect(await rowText(ui, 'C:/p/src')).toMatch(/src {2,}2 B$/)
+    expect(await rowText(ui, 'C:/p/node_modules')).toMatch(/node_modules {2,}0 B$/)
+    expect((await raw(ui)).every(r => width(r) === 60)).toBe(true)
+
+    await ui.press({ key: 'size' })
+    expect(await rowText(ui, 'C:/p/b.md')).toMatch(DATE_END)
+    await ui.press({ key: 'size' })
+    await run($, 'C:\\q')
+    expect(await rowText(ui, 'C:/q/q.txt')).toMatch(DATE_END)
+    await run($, 'C:\\p')
+    expect(await rowText(ui, 'C:/p/b.md')).toMatch(DATE_END)
+    expect((await header(ui, 'size'))?.props.dimColor).toBe(true)
+  })
+
+  test('column size: sizes from the start, Σ lit; Σ goes to dates', { options: { column: 'size' } }, async ($, on) => {
+    world(on, PROJECT())
+    await start($)
+    const ui = await mount($)
+    expect((await header(ui, 'size'))?.props.dimColor).toBe(undefined)
+    expect(await rowText(ui, 'C:/p/src')).toMatch(/src {2,}2 B$/)
+    await ui.press({ key: 'size' })
+    expect(await rowText(ui, 'C:/p/b.md')).toMatch(DATE_END)
+    expect(await rowText(ui, 'C:/p/src')).toMatch(/src *$/)
+  })
+
+  test('column age: right-aligned in 6, a redraw each minute moves it on', { options: { column: 'age', refresh: 'off' } }, async ($, on) => {
+    const { clock } = world(on, { ...PROJECT(), now: MTIME + 5 * 60_000 })
+    await start($)
+    const ui = await mount($)
+    expect(await rowText(ui, 'C:/p/b.md')).toMatch(/b\.md {2,}5m$/)
+    expect((await rowText(ui, 'C:/p/b.md')).endsWith('    5m')).toBe(true)
+    expect(width(await rowText(ui, 'C:/p/b.md'))).toBe(60)
+    await clock.advance(60_000)
+    await clock.settle()
+    expect(await rowText(ui, 'C:/p/b.md')).toMatch(/ 6m$/)
+    // Σ goes between sizes and ages.
+    await ui.press({ key: 'size' })
+    expect(await rowText(ui, 'C:/p/b.md')).toMatch(/ 1 B$/)
+    await ui.press({ key: 'size' })
+    expect(await rowText(ui, 'C:/p/b.md')).toMatch(/ 6m$/)
+  })
+
+  test('in the size mode the size takes the place of +a -d', async ($, on) => {
+    world(on, REPO())
+    await start($)
+    const ui = await mount($)
+    expect(await rowText(ui, 'C:/p/b.md')).toMatch(/ \+3 -1 M$/)
+    await ui.press({ key: 'size' })
+    const row = await rowText(ui, 'C:/p/b.md')
+    expect(row).not.toContain('+3')
+    expect(row).toMatch(/b\.md {2,}1 B M$/)
+    expect(width(row)).toBe(60)
+  })
+
+  test('the column goes when the narrowest name would be under 12; in the size mode folders count', async ($, on) => {
+    world(on, { cwd: 'C:/d', dirs: { 'C:/d': { 'b.md': 'file', src: 'dir' }, 'C:/d/src': { lib: 'dir' }, 'C:/d/src/lib': {} } })
+    await start($, 'C:/d')
+    let ui = await mount($, 'terminal', pane(25))
+    await pressOpen(ui, 'C:/d/src')
+    await ui.press({ key: 'size' })
+    // b.md alone would leave 12 columns; lib, one level down, leaves 10.
+    expect((await rowText(ui, 'C:/d/b.md')).trim()).toBe('· b.md')
+    expect((await rowText(ui, 'C:/d/src/lib')).trim()).toBe('▸ ■ lib')
+    await ui.unmount()
+    ui = await mount($, 'terminal', pane(27))
+    expect(await rowText(ui, 'C:/d/b.md')).toMatch(/ 1 B$/)
+    expect(await rowText(ui, 'C:/d/src/lib')).toMatch(/ 0 B$/)
+  })
+})
+
+describe('folder sizes (spec-07 R3, G1, G2)', () => {
+  test('… while measuring, then the total; links neither followed nor counted; past 50 000 entries or unlistable is ?', async ($, on) => {
+    const w = PROJECT()
+    w.dirs['C:/p/src']!['ln'] = 'link'
+    w.dirs['C:/p/src']!['up'] = 'dir-link'
+    w.dirs['C:/p/src/up'] = { 'huge.bin': 'file' }
+    w.dirs['C:/p/node_modules'] = Object.fromEntries(Array.from({ length: 50_001 }, (_, i) => [`m${i}.js`, 'file' as const]))
+    w.sizes = { 'C:/p/src/a.ts': 1536, 'C:/p/src/up/huge.bin': 10_000_000 }
+    w.denied = ['C:/p/.git']
+    w.delays = { 'C:/p/src': [1_000] }
+    const { log, clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    void ui.press({ key: 'size' })
+    await clock.settle()
+    // The render draws while the measure hangs (G2).
+    expect((await rowText(ui, 'C:/p/src')).endsWith('       …')).toBe(true)
+    await clock.advance(1_000)
+    await clock.settle()
+    expect(await rowText(ui, 'C:/p/src')).toMatch(/src {2,}1\.5 K$/)
+    expect(await rowText(ui, 'C:/p/node_modules')).toMatch(/node_modules {2,}\?$/)
+    expect(await rowText(ui, 'C:/p/.git')).toMatch(/\.git {2,}\?$/)
+    expect(log.toasts).toEqual([])
+  })
+
+  test('at most 2 measures at once', async ($, on) => {
+    const w = PROJECT()
+    w.delays = { 'C:/p/.git': [1_000], 'C:/p/node_modules': [1_000], 'C:/p/src': [1_000] }
+    const { log, clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    const measured = () => log.lists.filter(p => ['C:/p/.git', 'C:/p/node_modules', 'C:/p/src'].includes(p))
+    void ui.press({ key: 'size' })
+    await clock.settle()
+    expect(measured()).toEqual(['C:/p/.git', 'C:/p/node_modules'])
+    await clock.advance(1_000)
+    await clock.settle()
+    expect(measured()).toEqual(['C:/p/.git', 'C:/p/node_modules', 'C:/p/src'])
+    await clock.advance(1_000)
+    await clock.settle()
+    expect(await rowText(ui, 'C:/p/src')).toMatch(/ 2 B$/)
+  })
+
+  test('↻ drops the sizes, and a measure from before it writes nothing (G1)', { options: { refresh: 'off' } }, async ($, on) => {
+    const w = PROJECT()
+    w.delays = { 'C:/p/src': [1_000, 1_000] }
+    const { clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    void ui.press({ key: 'size' })
+    await clock.settle()
+    await clock.advance(500)
+    await ui.press({ key: 'refresh' })
+    // The measure from before ↻ ends at 1 000 and writes nothing; the new one ends at 1 500.
+    await clock.advance(500)
+    await clock.settle()
+    expect((await rowText(ui, 'C:/p/src')).endsWith('       …')).toBe(true)
+    await clock.advance(500)
+    await clock.settle()
+    expect(await rowText(ui, 'C:/p/src')).toMatch(/ 2 B$/)
+  })
+
+  test('a Write and a shell scan measure again; a tick does not', async ($, on) => {
+    const w = PROJECT()
+    const { log, clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: 'size' })
+    const measures = () => log.lists.filter(p => p === 'C:/p/node_modules').length
+    expect(measures()).toBe(1)
+    await clock.advance(5_000)
+    await clock.settle()
+    expect(measures()).toBe(1)
+    w.sizes = { 'C:/p/b.md': 2048 }
+    await call($, clock, editOf('C:/p/b.md'))
+    expect(measures()).toBe(2)
+    expect(await rowText(ui, 'C:/p/b.md')).toMatch(/ 2\.0 K$/)
+    await call($, clock, shell('stuff'))
+    expect(measures()).toBe(3)
+  })
+})
+
+describe('glyphs (spec-07 R4)', () => {
+  const fonts = (nerd: boolean): World => ({
+    ...PROJECT(),
+    env: FONT_ENV,
+    dirs: { ...PROJECT().dirs, [FONTS]: { 'arial.ttf': 'file' }, [MY_FONTS]: nerd ? { 'JetBrainsMonoNerdFont-Regular.ttf': 'file' } : {} },
+  })
+
+  test('auto with a Nerd Font in the person’s fonts: icons on the terminal, plain on the desktop', async ($, on) => {
+    const { log } = world(on, fonts(true))
+    await start($)
+    expect(log.lists).toEqual([FONTS, MY_FONTS, ROOT])
+    const ui = await mount($)
+    const rows = await names(ui)
+    expect(rows).toEqual([
+      `${icon(0xf460)} ${icon(0xe5ff)} .git`,
+      `${icon(0xf460)} ${icon(0xe5ff)} node_modules`,
+      `${icon(0xf460)} ${icon(0xe5ff)} src`,
+      `${icon(0xf0354)} b.md`,
+      `${icon(0xf481)} link`,
+    ])
+    expect((await raw(ui)).every(r => width(r) === 60)).toBe(true)
+    expect((await header(ui, 'size'))?.text).toBe(icon(0xf02ca))
+    expect((await ui.find({ type: 'Button', key: 'nav-o' }))?.text).toBe(`${icon(0xf03cb)} open`)
+    await ui.unmount()
+    const desk = await mount($, 'desktop')
+    expect(await names(desk)).toEqual(['▸ ■ .git', '▸ ■ node_modules', '▸ ■ src', '· b.md', '↪ link'])
+  })
+
+  test('auto without a Nerd Font, and plain with one, draw as before', async ($, on) => {
+    world(on, fonts(false))
+    await start($)
+    const ui = await mount($)
+    expect(await names(ui)).toEqual(['▸ ■ .git', '▸ ■ node_modules', '▸ ■ src', '· b.md', '↪ link'])
+    expect((await header(ui, 'size'))?.text).toBe('Σ')
+  })
+
+  test('plain: the font folders are not even listed', { options: { glyphs: 'plain' } }, async ($, on) => {
+    const { log } = world(on, fonts(true))
+    await start($)
+    expect(log.lists).toEqual([ROOT])
+    const ui = await mount($)
+    expect(await names(ui)).toContain('· b.md')
+  })
+
+  test('nerd: icons on the desktop too, and on the branch row', { options: { glyphs: 'nerd' } }, async ($, on) => {
+    world(on, REPO())
+    await start($)
+    const desk = await mount($, 'desktop')
+    expect((await names(desk)).find(r => r.includes('b.md'))).toMatch(new RegExp(`^${icon(0xf0354)} b\\.md +\\+3 -1 M$`, 'u'))
+    await desk.unmount()
+    const ui = await mount($)
+    expect(await texts(ui)).toContain(`${icon(0xf418)} `)
+  })
+
+  test('a row with icons past the basic plane is as wide as the pane less the bar', { options: { glyphs: 'nerd', hints: 'off' } }, async ($, on) => {
+    const long = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`a-rather-long-file-name-${i}.md`, 'file' as const]))
+    world(on, { cwd: 'C:/m', dirs: { 'C:/m': long } })
+    await start($, 'C:/m')
+    const ui = await mount($, 'terminal', pane(40, 20))
+    const props = await rowsOf(ui)
+    expect(props.bar).not.toBe(null)
+    expect((await raw(ui)).every(r => width(r) === 39)).toBe(true)
+    expect((await raw(ui))[0]).toContain('…')
+  })
+})
+
+describe('header hints (spec-07 R5)', () => {
+  test('over shows the hint that fits, leave hides it, one that does not fit never shows', async ($, on) => {
+    world(on, PROJECT())
+    await start($)
+    let ui = await mount($)
+    await ui.post({ over: true }, { in: 'button-size' })
+    expect(await texts(ui)).toContain('show sizes ')
+    await ui.post({ over: true }, { in: 'button-refresh' })
+    expect(await texts(ui)).toContain('reload tree and git ')
+    expect(await texts(ui)).not.toContain('show sizes ')
+    await ui.post({ over: false }, { in: 'button-refresh' })
+    expect((await texts(ui)).some(t => t.startsWith('reload'))).toBe(false)
+    await ui.unmount()
+    // 30 columns: six one-column buttons and five gaps leave 11 beside an 8-column title.
+    ui = await mount($, 'terminal', pane(30))
+    await ui.post({ over: true }, { in: 'button-size' })
+    expect(await texts(ui)).toContain('show sizes ')
+    await ui.post({ over: true }, { in: 'button-refresh' })
+    expect((await texts(ui)).some(t => t.startsWith('reload'))).toBe(false)
+  })
+
+  test('the pointer over a button and out of it, through the Client', async ($, on) => {
+    world(on, PROJECT())
+    await start($)
+    const ui = await mount($)
+    await ui.pointer({ type: 'move', x: 0, y: 0, in: 'button-collapse' })
+    expect(await texts(ui)).toContain('collapse all ')
+    await ui.pointer({ type: 'leave', x: 0, y: 0, in: 'button-collapse' })
+    expect(await texts(ui)).not.toContain('collapse all ')
+  })
+
+  test('a press posted by a button runs its action; the size hint says what comes next', async ($, on) => {
+    world(on, PROJECT())
+    await start($)
+    const ui = await mount($)
+    await ui.post({ press: true }, { in: 'button-hidden' })
+    expect(await names(ui)).not.toContain('▸ ■ .git')
+    await ui.post({ over: true }, { in: 'button-size' })
+    await ui.post({ press: true }, { in: 'button-size' })
+    expect(await texts(ui)).toContain('show dates ')
+  })
+
+  test('malformed messages and unknown buttons are ignored', async ($, on) => {
+    world(on, PROJECT())
+    await start($)
+    const ui = await mount($)
+    const before = await raw(ui)
+    for (const data of [{ over: 'yes' }, { press: false }, { over: true, press: true }, 'press', null, [true]] as any[]) {
+      await ui.post(data, { in: 'button-size' })
+    }
+    expect(await raw(ui)).toEqual(before)
+    expect((await texts(ui)).some(t => t.startsWith('show'))).toBe(false)
+    const { hooks, $: d$, state } = direct()
+    expect(await hooks['ui.message'](d$, { element: 'button-nope', requestId: 'filetree', surface: 'terminal', data: { press: true } }, async () => 'next')).toEqual({})
+    expect(await hooks['ui.message'](d$, { element: 'button-up', requestId: 'filetree', surface: 'terminal', data: { press: 1 } }, async () => 'next')).toEqual({})
+    expect(state).toEqual({})
+  })
+})
+
+describe('row hover (spec-07 R6)', () => {
+  test('a resting pointer lights its row, not the cursor row; leave clears it; the mod hears nothing', async ($, on) => {
+    world(on, PROJECT())
+    await start($)
+    const ui = await mount($)
+    await ui.key({ key: 'j', in: 'rows' })
+    const props = await rowsOf(ui)
+    await ui.pointer({ type: 'move', x: 5, y: 2, in: 'rows' })
+    expect((await rowBoxes(ui)).map(b => b.props.backgroundColor ?? null)).toEqual([null, null, 'subtle', null, null])
+    await ui.pointer({ type: 'move', x: 5, y: 0, in: 'rows' })
+    expect((await rowBoxes(ui)).map(b => b.props.backgroundColor ?? null)).toEqual([null, null, null, null, null])
+    await ui.pointer({ type: 'move', x: 5, y: 3, in: 'rows' })
+    await ui.pointer({ type: 'leave', x: 5, y: 3, in: 'rows' })
+    expect((await rowBoxes(ui)).every(b => b.props.backgroundColor === undefined)).toBe(true)
+    expect(await rowsOf(ui)).toEqual(props)
+  })
+
+  test('a drag on the bar clears the light', { options: { hints: 'off' } }, async ($, on) => {
+    const many = Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`f${String(i).padStart(4, '0')}.txt`, 'file' as const]))
+    world(on, { cwd: 'C:/m', dirs: { 'C:/m': many } })
+    await start($, 'C:/m')
+    const ui = await mount($, 'terminal', pane(60, 20))
+    await ui.resize({ columns: 60, rows: 18, in: 'rows' })
+    await ui.pointer({ type: 'move', x: 5, y: 2, in: 'rows' })
+    expect((await rowBoxes(ui))[2]?.props.backgroundColor).toBe('subtle')
+    await ui.pointer({ type: 'down', x: 59, y: 9, button: 'left', in: 'rows' })
+    expect((await rowBoxes(ui)).every(b => b.props.backgroundColor === undefined)).toBe(true)
   })
 })

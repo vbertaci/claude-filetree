@@ -46,6 +46,7 @@ export function toNodes(paths: Paths, dir: string, entries: readonly FsEntry[]):
       kind: kindOf(entry),
       hidden: entry.name.startsWith('.'),
       mtimeMs: entry.mtimeMs,
+      size: kindOf(entry) === 'file' ? entry.size : 0,
       loaded: false,
     }))
     .sort((a, b) => {
@@ -85,7 +86,7 @@ export function replaceChildren(paths: Paths, t: TreeState, dir: string, childre
   })
   const kept = t.nodes
     .filter(n => n.parent !== dir && !isGone(n.id))
-    .map(n => (n.id === dir ? { id: n.id, parent: n.parent, name: n.name, kind: n.kind, hidden: n.hidden, mtimeMs: n.mtimeMs, loaded: true } : n))
+    .map(n => (n.id === dir ? { id: n.id, parent: n.parent, name: n.name, kind: n.kind, hidden: n.hidden, mtimeMs: n.mtimeMs, size: n.size, loaded: true } : n))
   const tree = { ...t, nodes: [...kept, ...merged], expanded: t.expanded.filter(id => !isGone(id)) }
 
   return {

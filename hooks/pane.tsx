@@ -1,10 +1,12 @@
 import type { EngineInterface, RenderElement, RenderInput } from 'claude-code'
 
-import type { GitChip, GitLetter, GitState, Glow, RowSpec, RowsProps, Seg, ThemeKeyName, Tone, TreeState } from '../types'
+import type { ButtonProps, GitChip, GitLetter, GitState, Glow, RowSpec, RowsProps, Seg, ThemeKeyName, Tone, TreeState } from '../types'
+import { type ColumnMode, cellText, widthOf } from './columns'
 import { BRANCH_ID, type NodeGit, gitOf } from './git'
+import { type GlyphSet, LABELS, caret, chipIcon, cols, nodeGlyph, take } from './icons'
 import type { Paths } from './os'
 import { termOf } from './search'
-import { type Row, formatDate, visibleRows, windowOf } from './tree'
+import { type Row, visibleRows, windowOf } from './tree'
 
 export const DESKTOP_ROW_CAP = 1500
 /**
@@ -12,8 +14,13 @@ export const DESKTOP_ROW_CAP = 1500
  * must stay under 100,000 characters, and the drawn tree runs about 1.5 times the props.
  */
 export const DESKTOP_CHAR_BUDGET = 45_000
-const DATE_WIDTH = 16
 const MIN_NAME = 12
+/** The narrowest title a hint leaves (spec-07 R5.4). */
+const MIN_TITLE = 8
+
+/** The header buttons, each a Client of its own, in the order they show (spec-07 R5.1). */
+export const HEADER_IDS = ['up', 'cwd', 'refresh', 'hidden', 'size', 'collapse', 'unselect'] as const
+export type HeaderId = (typeof HEADER_IDS)[number]
 
 /** What glows while a glow is live; `focus` is null when follow is off. */
 export type GlowView = { lit: Record<string, Glow>; focus: string | null } | null
@@ -24,6 +31,9 @@ export type GitView = { state: GitState; hints: boolean } | null
 /** The row under the header: the branch inside a repository, the hint outside one. */
 export type Extra = 'branch' | 'hint' | null
 
+/** How the rows look: the column's mode, the folder sizes of this root by Paths.key, the glyph set, the time (spec-07). */
+export type Look = { mode: ColumnMode; bytes: Record<string, number>; glyphs: GlyphSet; now: number }
+
 export type Layout = {
   rows: Row[]
   from: number
@@ -31,24 +41,21 @@ export type Layout = {
   room: number
   extra: Extra
   props: RowsProps
+  /** In the size mode, the folders the Client gets that have no size yet (spec-07 R3.1). */
+  sizeWanted: string[]
 }
 
-/** Each returns the work it started, so a press settles once that work has. */
+/** What the header draws besides the tree: the glyphs, the column, the button under the pointer. */
+export type HeaderLook = { glyphs: GlyphSet; mode: ColumnMode; timeMode: 'date' | 'age'; hovered: string }
+
+/** Each returns the work it started, so a press settles once that work has. The header buttons post instead. */
 export type PaneActions = {
-  up: () => Promise<unknown>
-  cwd: () => Promise<unknown>
-  refresh: () => Promise<unknown>
-  hidden: () => Promise<unknown>
-  collapse: () => Promise<unknown>
-  unselect: () => Promise<unknown>
   nav: (key: 'down' | 'up' | 'left' | 'right' | 'return') => Promise<unknown>
   search: (value: string) => Promise<unknown>
   jump: (value: string) => Promise<unknown>
   clear: () => Promise<unknown>
   focusSearch: () => Promise<unknown>
 }
-
-const GLYPH = { dir: '■', file: '·', link: '↪', other: '◇' } as const
 
 const LETTER_COLOR: Record<GitLetter, ThemeKeyName> = {
   '?': 'success',
@@ -74,7 +81,7 @@ type Cells = { git: NodeGit | null; loc: Seg[]; cell: Seg[] }
 
 const NO_CELLS: Cells = { git: null, loc: [], cell: [] }
 
-const width = (segs: readonly Seg[]): number => segs.reduce((n, s) => n + s.text.length, 0)
+const width = (segs: readonly Seg[]): number => segs.reduce((n, s) => n + cols(s.text), 0)
 
 export function rootLabel(paths: Paths, root: string): string {
   return paths.parent(root) === null ? paths.native(root) : paths.base(root)
@@ -109,33 +116,42 @@ function fixedWidth(row: Row, bar: number, cells: Cells): number {
   return row.depth * 2 + 2 + 2 + bar + suffix.length + width(cells.cell)
 }
 
-/** The narrowest name the date column leaves; files with `+a -d` show no date. */
-function showsDate(rows: readonly Row[], cellsOf: (r: Row) => Cells, bar: number, total: number): boolean {
-  const dated = rows.filter(r => r.node.kind === 'file' && cellsOf(r).loc.length === 0)
-  return Math.min(...dated.map(r => total - fixedWidth(r, bar, cellsOf(r)) - DATE_WIDTH - 1)) >= MIN_NAME
+/** What a row's column and glyph read: the look, and the lookups that need the paths. */
+type RowLook = Look & { bytesOf: (id: string) => number | undefined; isRepo: (id: string) => boolean }
+
+/** The `+a -d` a row draws: none in the size mode, where the size takes the column (spec-07 R2.4). */
+const locOf = (cells: Cells, mode: ColumnMode): Seg[] => (mode === 'size' ? [] : cells.loc)
+
+/** The narrowest name the column leaves, among the rows it shows on (spec-01 R4.4, spec-07 R2.5). */
+function showsColumn(rows: readonly Row[], cellsOf: (r: Row) => Cells, bar: number, total: number, mode: ColumnMode): boolean {
+  const counted = rows.filter(r =>
+    mode === 'size' ? r.node.kind === 'file' || r.node.kind === 'dir' : r.node.kind === 'file' && cellsOf(r).loc.length === 0,
+  )
+  return Math.min(...counted.map(r => total - fixedWidth(r, bar, cellsOf(r)) - widthOf(mode) - 1)) >= MIN_NAME
 }
 
-function rowSpec(row: Row, t: TreeState, total: number, bar: number, showDate: boolean, glow: GlowView, cells: Cells): RowSpec {
+function rowSpec(row: Row, t: TreeState, total: number, bar: number, showColumn: boolean, glow: GlowView, cells: Cells, look: RowLook): RowSpec {
   const { node } = row
   const fixed = fixedWidth(row, bar, cells)
-  const loc = width(cells.loc)
-  const dated = showDate && node.kind === 'file' && loc === 0
-  const budget = Math.max(1, total - fixed - (loc > 0 ? loc : dated ? DATE_WIDTH + 1 : 0))
-  const name = node.name.length > budget ? `${node.name.slice(0, budget - 1)}…` : node.name
+  const locSegs = locOf(cells, look.mode)
+  const loc = width(locSegs)
+  const text = showColumn && loc === 0 ? cellText(look.mode, node, look.bytesOf(node.id), look.now) : ''
+  const column = text === '' ? '' : text.padStart(widthOf(look.mode))
+  const budget = Math.max(1, total - fixed - (loc > 0 ? loc : column !== '' ? cols(column) + 1 : 0))
+  const name = cols(node.name) > budget ? `${take(node.name, budget - 1)}…` : node.name
   const isSelected = node.id === t.selected
 
-  const used = fixed - bar + name.length
-  const date = dated ? formatDate(node.mtimeMs) : ''
-  const pad = ' '.repeat(Math.max(dated ? 1 : 0, total - bar - used - date.length - loc))
+  const used = fixed - bar + cols(name)
+  const pad = ' '.repeat(Math.max(column !== '' ? 1 : 0, total - bar - used - cols(column) - loc))
   const indent = '  '.repeat(row.depth)
-  const caret = node.kind === 'dir' ? (row.isOpen ? '▾ ' : '▸ ') : '  '
-  const glyph = `${GLYPH[node.kind]} `
+  const turn = node.kind === 'dir' ? caret(look.glyphs, row.isOpen) : '  '
+  const glyph = `${nodeGlyph(look.glyphs, node, row.isOpen, look.isRepo(node.id))} `
 
   // Spaces take the style of the segment they join, so a row is as few segments as its colors.
   const segs: Seg[] =
     node.kind === 'dir'
-      ? [{ text: indent + caret, color: 'subtle' }, { text: glyph, color: 'suggestion' }]
-      : [{ text: indent + caret + glyph, color: 'subtle' }]
+      ? [{ text: indent + turn, color: 'subtle' }, { text: glyph, color: 'suggestion' }]
+      : [{ text: indent + turn + glyph, color: 'subtle' }]
   const g = cells.git
   const plainColor: ThemeKeyName = node.hidden ? 'subtle' : 'text'
   const color: ThemeKeyName = g?.letter ? LETTER_COLOR[g.letter] : g?.ignored ? 'subtle' : plainColor
@@ -151,8 +167,8 @@ function rowSpec(row: Row, t: TreeState, total: number, bar: number, showDate: b
   // A struck name keeps its line off the padding.
   else if (strike) segs.push({ text: name, ...nameStyle }, ...(pad !== '' ? [{ text: pad, color }] : []))
   else segs.push({ text: name + pad, ...nameStyle })
-  if (dated) segs.push({ text: date, color: 'subtle' })
-  segs.push(...cells.loc, ...cells.cell)
+  if (column !== '') segs.push({ text: column, color: 'subtle' })
+  segs.push(...locSegs, ...cells.cell)
   return { id: node.id, segs, active: node.id === t.cursor }
 }
 
@@ -171,11 +187,20 @@ export function layoutPane(
   paths: Paths,
   chip: GitChip | null,
   keep: ReadonlySet<string> | null,
+  look: Look,
 ): Layout {
   const rows = visibleRows(t, keep)
   const total = Math.max(1, view.bodyColumns)
   const extra = extraOf(git)
   const repo = git !== null && git.state.top !== '' ? git.state : null
+  const rowLook: RowLook = {
+    ...look,
+    bytesOf: id => look.bytes[paths.key(id)],
+    isRepo: id => repo !== null && paths.same(id, repo.top),
+  }
+  // The folders drawn without a size, for the render to queue (spec-07 R3.1, R3.6).
+  const wanted = (drawn: readonly Row[]): string[] =>
+    look.mode === 'size' ? drawn.filter(r => r.node.kind === 'dir' && rowLook.bytesOf(r.id) === undefined).map(r => r.id) : []
   const cache = new Map<string, Cells>()
   const cellsOf = (r: Row): Cells => {
     if (repo === null) return NO_CELLS
@@ -189,12 +214,12 @@ export function layoutPane(
 
   if (view.surface !== 'terminal') {
     const candidates = rows.slice(0, DESKTOP_ROW_CAP)
-    const showDate = showsDate(candidates, cellsOf, 0, total)
+    const showColumn = showsColumn(candidates, cellsOf, 0, total, look.mode)
     // Whichever comes first: the row cap or the character budget of the Client's props.
     const specs: RowSpec[] = []
     let chars = 0
     for (const r of candidates) {
-      const spec = rowSpec(r, t, total, 0, showDate, glow, cellsOf(r))
+      const spec = rowSpec(r, t, total, 0, showColumn, glow, cellsOf(r), rowLook)
       chars += JSON.stringify(spec).length + 1
       if (chars > DESKTOP_CHAR_BUDGET) break
       specs.push(spec)
@@ -211,6 +236,7 @@ export function layoutPane(
         empty: rows.length === 0 ? 'empty' : null,
         more: rows.length - specs.length,
       },
+      sizeWanted: wanted(candidates.slice(0, specs.length)),
     }
   }
 
@@ -223,7 +249,7 @@ export function layoutPane(
   const { from, max } = windowOf(rows.length, cursorIndex, room, t.scroll)
   const shown = rows.slice(from, from + room)
   const bar = rows.length > room ? 1 : 0
-  const showDate = showsDate(shown, cellsOf, bar, total)
+  const showColumn = showsColumn(shown, cellsOf, bar, total, look.mode)
   const thumbSize = Math.max(1, Math.round((room * room) / Math.max(1, rows.length)))
   return {
     rows,
@@ -232,12 +258,43 @@ export function layoutPane(
     room,
     extra,
     props: {
-      rows: shown.map(r => rowSpec(r, t, total, bar, showDate, glow, cellsOf(r))),
+      rows: shown.map(r => rowSpec(r, t, total, bar, showColumn, glow, cellsOf(r), rowLook)),
       bar: bar ? { thumbFrom: max === 0 ? 0 : Math.round((from / max) * (room - thumbSize)), thumbSize } : null,
       empty: rows.length === 0 ? 'empty' : null,
       more: 0,
     },
+    sizeWanted: wanted(shown),
   }
+}
+
+type HeaderButton = ButtonProps & { id: HeaderId; hint: string }
+
+/** The header buttons with their labels and what each does, as the hint says it (spec-07 R1.2, R5, Dicas). */
+function headerButtons(t: TreeState, look: HeaderLook): HeaderButton[] {
+  const L = LABELS[look.glyphs]
+  const sizeOn = look.mode === 'size'
+  return [
+    { id: 'up', label: L.up, dim: false, hint: 'parent folder' },
+    { id: 'cwd', label: L.cwd, dim: !t.follow, hint: 'follow the cwd' },
+    { id: 'refresh', label: L.refresh, dim: false, hint: 'reload tree and git' },
+    {
+      id: 'hidden',
+      label: t.showHidden ? L['hidden-on'] : L['hidden-off'],
+      dim: false,
+      hint: t.showHidden ? 'hide hidden files' : 'show hidden files',
+    },
+    { id: 'size', label: L.size, dim: !sizeOn, hint: !sizeOn ? 'show sizes' : look.timeMode === 'age' ? 'show ages' : 'show dates' },
+    { id: 'collapse', label: L.collapse, dim: false, hint: 'collapse all' },
+    ...(t.selected !== '' ? [{ id: 'unselect' as const, label: L.unselect, dim: false, hint: 'clear selection' }] : []),
+  ]
+}
+
+/** The hovered button's hint, or '' when it would squeeze the title under MIN_TITLE columns (spec-07 R5.4). */
+function hintOf(buttons: readonly HeaderButton[], hovered: string, bodyColumns: number): string {
+  const text = buttons.find(b => b.id === hovered)?.hint
+  const buttonsWidth = buttons.reduce((n, b) => n + cols(b.label), 0) + Math.max(0, buttons.length - 1)
+  const room = bodyColumns - buttonsWidth - MIN_TITLE
+  return text !== undefined && cols(text) + 1 <= room ? text : ''
 }
 
 export function renderPane(
@@ -250,10 +307,14 @@ export function renderPane(
   glow: GlowView,
   chip: GitChip | null,
   query: string,
+  look: HeaderLook,
   actions: PaneActions,
 ): RenderElement {
   const { Box, Text, Button, Input, Client } = $.ui.resolve(e)
   const terminal = e.surface === 'terminal'
+  const L = LABELS[look.glyphs]
+  const buttons = headerButtons(t, look)
+  const hint = hintOf(buttons, look.hovered, e.props.bodyColumns)
 
   // The branch and the root's totals; the upstream is the first thing cut (spec-03 R6).
   const branchRow = () => {
@@ -268,7 +329,7 @@ export function renderPane(
       <Box flexDirection="row">
         <Box flexDirection="row" flexShrink={0}>
           <Text color={lit ? TONE_COLOR[lit.tone] : 'suggestion'} {...(lit ? { weight: 'bold' as const } : {})}>
-            ⑂{' '}
+            {`${L.branch} `}
           </Text>
           <Text color={lit ? TONE_COLOR[lit.tone] : 'text'} weight="bold">
             {b.head}
@@ -304,13 +365,12 @@ export function renderPane(
             {rootLabel(paths, t.root)}
           </Text>
         </Box>
+        {hint !== '' && <Text color="subtle">{`${hint} `}</Text>}
+        {/* Each button is a Client only so it can say when the pointer is over it; a press posts back (spec-07 R5). */}
         <Box flexDirection="row" flexShrink={0} gap={1}>
-          <Button key="up" plain onPress={actions.up}>↑</Button>
-          <Button key="cwd" plain {...(t.follow ? {} : { dimColor: true as const })} onPress={actions.cwd}>⌂</Button>
-          <Button key="refresh" plain onPress={actions.refresh}>↻</Button>
-          <Button key="hidden" plain onPress={actions.hidden}>{t.showHidden ? '◉' : '○'}</Button>
-          <Button key="collapse" plain onPress={actions.collapse}>⊟</Button>
-          {t.selected !== '' && <Button key="unselect" plain onPress={actions.unselect}>⊘</Button>}
+          {buttons.map(b => (
+            <Client key={`button-${b.id}`} module="./button.tsx" props={{ id: b.id, label: b.label, dim: b.dim } satisfies ButtonProps} />
+          ))}
         </Box>
       </Box>
       {layout.extra === 'branch' && branchRow()}
@@ -320,14 +380,14 @@ export function renderPane(
         </Text>
       )}
       <Box flexDirection="row" gap={2}>
-        <Button key="nav-j" plain dimColor hotkey="j" onPress={() => actions.nav('down')}>↓</Button>
-        <Button key="nav-k" plain dimColor hotkey="k" onPress={() => actions.nav('up')}>↑</Button>
-        <Button key="nav-h" plain dimColor hotkey="h" onPress={() => actions.nav('left')}>←</Button>
-        <Button key="nav-l" plain dimColor hotkey="l" onPress={() => actions.nav('right')}>→</Button>
-        <Button key="nav-o" plain dimColor hotkey="o" autoFocus onPress={() => actions.nav('return')}>open</Button>
+        <Button key="nav-j" plain dimColor hotkey="j" onPress={() => actions.nav('down')}>{L['nav-j']}</Button>
+        <Button key="nav-k" plain dimColor hotkey="k" onPress={() => actions.nav('up')}>{L['nav-k']}</Button>
+        <Button key="nav-h" plain dimColor hotkey="h" onPress={() => actions.nav('left')}>{L['nav-h']}</Button>
+        <Button key="nav-l" plain dimColor hotkey="l" onPress={() => actions.nav('right')}>{L['nav-l']}</Button>
+        <Button key="nav-o" plain dimColor hotkey="o" autoFocus onPress={() => actions.nav('return')}>{L['nav-o']}</Button>
         {/* The search shares the row and gives way first, so the tree keeps its rows (spec-06 R1.1, R1.4). */}
         <Box flexDirection="row" flexGrow={1} flexShrink={1} overflow="hidden">
-          <Button key="nav-s" plain dimColor hotkey="s" onPress={actions.focusSearch}>/</Button>
+          <Button key="nav-s" plain dimColor hotkey="s" onPress={actions.focusSearch}>{L['nav-s']}</Button>
           <Box flexGrow={1} flexShrink={1}>
             <Input key="q" placeholder="search" submitLabel="jump" value={query} onInput={actions.search} onSubmit={actions.jump} />
           </Box>
@@ -350,7 +410,7 @@ export function renderPane(
           </Box>
           {chip !== null && (
             <Box flexDirection="row" flexShrink={0} marginLeft={2}>
-              <Text color={TONE_COLOR[chip.tone]}>{`${chip.icon} ${chip.text}`}</Text>
+              <Text color={TONE_COLOR[chip.tone]}>{`${chipIcon(look.glyphs, chip.icon)} ${chip.text}`}</Text>
               {chip.detail !== '' && <Text color="subtle">{` ${chip.detail}`}</Text>}
             </Box>
           )}

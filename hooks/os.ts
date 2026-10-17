@@ -150,3 +150,11 @@ export async function detectHome($: EngineInterface, p: Paths): Promise<string> 
   const home = p.platform === 'windows' ? await $.env.get('USERPROFILE') : await $.env.get('HOME')
   return home ? p.norm(home) : ''
 }
+
+/** Where installed fonts live: on Windows the machine's and the person's folders; none elsewhere (spec-07 R4.2). */
+export async function fontDirs($: EngineInterface, p: Paths): Promise<string[]> {
+  if (p.platform !== 'windows') return []
+  const windir = await $.env.get('WINDIR')
+  const local = await $.env.get('LOCALAPPDATA')
+  return [windir ? p.join(p.norm(windir), 'Fonts') : '', local ? p.join(p.norm(local), 'Microsoft/Windows/Fonts') : ''].filter(Boolean)
+}

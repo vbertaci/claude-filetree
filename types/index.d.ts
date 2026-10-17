@@ -11,6 +11,8 @@ export type FileNode = {
   hidden: boolean
   /** 0 for anything but a regular file (FsEntry). */
   mtimeMs: number
+  /** Bytes for a regular file; 0 for anything else. */
+  size: number
   /** Folders only: children listed. */
   loaded: boolean
   /** Folders only: message of the last listing that failed. */
@@ -118,6 +120,15 @@ export type SearchState = {
   query: string
 }
 
+export type ColumnsState = {
+  /** tree.root when Σ was last pressed or a size was measured; under another root the option rules (spec-07 R1.4). */
+  root: string
+  /** Σ's choice for that root: true = size; null = not pressed. */
+  size: boolean | null
+  /** Paths.key of a folder → bytes under it; -1 = unknown or past the limit (spec-07 R3). */
+  bytes: Record<string, number>
+}
+
 /** Shapes shared between pane.tsx and the rows.tsx Client. */
 export type ThemeKeyName = 'text' | 'subtle' | 'suggestion' | 'error' | 'claude' | 'autoAccept' | 'success' | 'warning' | 'merged'
 
@@ -136,6 +147,9 @@ export type RowsProps = {
   more: number
 }
 
+/** What pane.tsx hands each header button Client (spec-07 R5.1). */
+export type ButtonProps = { id: string; label: string; dim: boolean }
+
 export type RowsMessage =
   | { kind: 'key'; key: string; ctrl?: true; shift?: true }
   | { kind: 'press'; id: string; button: 'left' | 'right'; ctrl?: true; shift?: true }
@@ -150,6 +164,7 @@ declare module 'claude-code' {
       git: GitState
       chip: GitChip | null
       search: SearchState
+      columns: ColumnsState
     }
   }
 }
