@@ -20,8 +20,14 @@ type World = {
   mtimes?: Record<string, number>
   /** The tool beneath the plugin: what a tool call answers. */
   tool?: (e: any) => any
+  /** git beneath the plugin, by subcommand; default: not a repository. */
+  git?: (sub: string, argv: string[]) => GitAnswer
+  /** Delays (ms) of successive git runs, by subcommand. */
+  gitDelays?: Record<string, number[]>
 }
-type Log = { opens: any[]; closes: string[]; toasts: string[]; copies: string[]; lists: string[]; calls: any[] }
+/** A string is stdout with exit 0; 'reject' is a git that cannot start. */
+type GitAnswer = string | { exitCode: number; stdout?: string } | 'reject'
+type Log = { opens: any[]; closes: string[]; toasts: string[]; copies: string[]; lists: string[]; calls: any[]; runs: string[][] }
 
 const N = (p: string) => p.replace(/\\/g, '/').replace(/^([a-z]):/, (_, d: string) => `${d.toUpperCase()}:`)
 const PLUGIN = 'filetree-local'
@@ -29,7 +35,7 @@ const ROOT = 'C:/p'
 const MTIME = 1_700_000_000_000
 
 function world(on: On, w: World) {
-  const log: Log = { opens: [], closes: [], toasts: [], copies: [], lists: [], calls: [] }
+  const log: Log = { opens: [], closes: [], toasts: [], copies: [], lists: [], calls: [], runs: [] }
   const open = new Set<string>()
   mock.env(on, { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\w4rl0ck' })
   const clock = mock.clock(on, { now: w.now ?? 1_000_000 })
@@ -87,6 +93,18 @@ function world(on: On, w: World) {
     const cut = p.lastIndexOf('/')
     if (w.dirs[p.slice(0, cut)]?.[p.slice(cut + 1)]) return { value: { kind: 'file', size: 1, mtimeMs: MTIME, isLink: false } } as any
     return { deny: `ENOENT: no such file or directory, stat '${e.path}'` } as any
+  })
+  on('process.run', async (_$: any, e: any) => {
+    const argv = [...e.argv] as string[]
+    log.runs.push(argv)
+    const sub = argv[6] ?? ''
+    // The answer is what git saw when it started; a delay only holds it back.
+    const a: GitAnswer = w.git ? w.git(sub, argv) : { exitCode: 128 }
+    const delay = w.gitDelays?.[sub]?.shift()
+    if (delay) await clock.sleep(delay)
+    if (a === 'reject') return { deny: 'ENOENT: spawn git.exe' } as any
+    const r = typeof a === 'string' ? { exitCode: 0, stdout: a } : a
+    return { value: { exitCode: r.exitCode, stdout: r.stdout ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } as any
   })
   return { log, clock }
 }
@@ -274,7 +292,7 @@ describe('scrolling (R5)', () => {
     dirs: { 'C:/m': Object.fromEntries(Array.from({ length: n }, (_, i) => [`f${String(i).padStart(4, '0')}.txt`, 'file' as const])) },
   })
 
-  test('the terminal gets only the window; the wheel and the bar move it', async ($, on) => {
+  test('the terminal gets only the window; the wheel and the bar move it', { options: { hints: 'off' } }, async ($, on) => {
     world(on, many(100))
     await start($, 'C:/m')
     const ui = await mount($, 'terminal', pane(60, 20))
@@ -988,5 +1006,286 @@ describe('options, follow and end of turn (spec-02 R3, R7)', () => {
     expect(log.lists).toEqual([ROOT])
     expect(await names(ui)).toContain('· late.txt')
     expect(await glowOf(ui)).toEqual({})
+  })
+})
+
+// ---- spec-03: git status ----
+
+/** NUL-terminated records, as `git -z` writes them. */
+const Z = (...records: string[]) => records.map(r => `${r}\0`).join('')
+const STATUS = Z('## main...origin/main [ahead 1, behind 2]', ' M b.md', '?? src/lib/', '!! node_modules/')
+const FLAGS = ['git.exe', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-C']
+/** C:/p as the top of a repository: b.md modified (+3 -1), src/lib untracked, node_modules ignored. */
+const repo =
+  (status: () => string = () => STATUS) =>
+  (sub: string): GitAnswer => {
+    if (sub === 'rev-parse') return '\nC:/p\n'
+    if (sub === 'status') return status()
+    if (sub === 'diff') return Z('3\t1\tb.md')
+    if (sub === 'ls-files') return Z('src/lib/x.ts')
+    return { exitCode: 129 }
+  }
+const REPO = (): World => ({ ...PROJECT(), git: repo() })
+const subs = (log: Log) => log.runs.map(a => a[6])
+const reads = (log: Log) => subs(log).filter(s => s === 'rev-parse').length
+/** The pane's own Texts (not the rows), by what they show. */
+const texts = async (ui: any): Promise<string[]> => (await ui.findAll({ type: 'Text' })).map((t: any) => t.text)
+const rowOf = async (ui: any, id: string) => (await rowsOf(ui)).rows.find(r => r.id === id)!
+const nameSeg = async (ui: any, id: string, name: string) => (await rowOf(ui, id)).segs.find(s => s.text.startsWith(name))
+
+describe('running git (spec-03 R1, R2)', () => {
+  test('a read runs git by argv, with the fixed flags and the paths after --', async ($, on) => {
+    const { log } = world(on, REPO())
+    await start($)
+    expect(subs(log)).toEqual(['rev-parse', 'status', 'ls-files', 'diff'])
+    for (const argv of log.runs) expect(argv.slice(0, 6)).toEqual([...FLAGS, 'C:\\p'])
+    expect(log.runs[0]!.slice(7)).toEqual(['--show-prefix', '--show-toplevel'])
+    expect(log.runs[1]!.slice(7)).toEqual(['--porcelain=v1', '-b', '-z', '--ignored=traditional', '--untracked-files=normal', '--', '.'])
+    expect(log.runs[2]!.slice(7)).toEqual(['-o', '--exclude-standard', '-z', '--', 'src/lib'])
+    expect(log.runs[3]!.slice(7)).toEqual(['HEAD', '--numstat', '-z', '--no-ext-diff', '--no-textconv', '--', '.'])
+  })
+
+  test('outside a repository only rev-parse runs, a hint says so and the rows are as before', async ($, on) => {
+    const { log } = world(on, PROJECT())
+    await start($)
+    const ui = await mount($)
+    expect(subs(log)).toEqual(['rev-parse'])
+    const hint = await ui.find({ type: 'Text', text: '± no git repo · git status starts after git init' })
+    expect(hint?.props.color).toBe('subtle')
+    expect(await texts(ui)).not.toContain('⑂ ')
+    const rows = await raw(ui)
+    expect(rows.every(r => r.length === 60)).toBe(true)
+    expect(rows.find(r => r.includes('b.md'))).toMatch(/\d{2}:\d{2}$/)
+  })
+
+  test('a git that cannot start says git not found', async ($, on) => {
+    const { log } = world(on, { ...PROJECT(), git: () => 'reject' })
+    await start($)
+    const ui = await mount($)
+    expect(subs(log)).toEqual(['rev-parse'])
+    expect(await ui.find({ type: 'Text', text: '± git not found · status colors need git on the PATH' })).toBeDefined()
+    expect(log.toasts).toEqual([])
+  })
+
+  test('hints off: no line', { options: { hints: 'off' } }, async ($, on) => {
+    world(on, PROJECT())
+    await start($)
+    const ui = await mount($)
+    expect((await texts(ui)).some(t => t.startsWith('±'))).toBe(false)
+  })
+
+  test('a git init shows on the next read, and a repository with a prefix maps its paths', async ($, on) => {
+    const w = PROJECT()
+    const { log } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    expect(await ui.find({ type: 'Text', text: '± no git repo' })).toBeDefined()
+    w.git = repo()
+    await ui.press({ key: 'refresh' })
+    expect(await ui.find({ type: 'Text', text: '± no git repo' })).toBe(undefined)
+    expect(await texts(ui)).toContain('main')
+
+    // The root one level down: git paths are relative to the top and lose the prefix.
+    w.git = sub => (sub === 'rev-parse' ? 'src/\nC:/p\n' : sub === 'status' ? Z('## main', ' M src/a.ts', ' M b.md') : sub === 'diff' ? '' : { exitCode: 1 })
+    log.runs.length = 0
+    await run($, 'C:/p/src')
+    expect(log.runs.every(a => a[5] === 'C:\\p\\src')).toBe(true)
+    expect((await rowOf(ui, 'C:/p/src/a.ts')).segs.at(-1)).toEqual({ text: ' M', color: 'warning', bold: true })
+  })
+})
+
+describe('git on the rows (spec-03 R3, R5)', () => {
+  test('colors, cells, +a -d in the date place, counts on folders, every row the full width', async ($, on) => {
+    world(on, REPO())
+    await start($)
+    const ui = await mount($)
+    const b = await rowOf(ui, 'C:/p/b.md')
+    expect((await nameSeg(ui, 'C:/p/b.md', 'b.md'))?.color).toBe('warning')
+    expect(b.segs.slice(-3)).toEqual([
+      { text: ' +3', color: 'success' },
+      { text: ' -1', color: 'error' },
+      { text: ' M', color: 'warning', bold: true },
+    ])
+    expect(b.segs.map(s => s.text).join('')).not.toMatch(/\d{2}:\d{2}/)
+    // src holds the untracked src/lib, whose x.ts ls-files counted as new.
+    expect((await nameSeg(ui, 'C:/p/src', 'src'))?.color).toBe('success')
+    expect((await rowOf(ui, 'C:/p/src')).segs.at(-1)).toEqual({ text: ' ?:1', color: 'success' })
+    expect((await nameSeg(ui, 'C:/p/node_modules', 'node_modules'))?.color).toBe('subtle')
+    expect((await rowOf(ui, 'C:/p/node_modules')).segs.at(-1)).toEqual({ text: ' ⊘', color: 'subtle' })
+    expect((await rowOf(ui, 'C:/p/.git')).segs.at(-1)).toEqual({ text: '  ' })
+    expect((await raw(ui)).every(r => r.length === 60)).toBe(true)
+  })
+
+  test('below an untracked folder every node is ?', async ($, on) => {
+    world(on, REPO())
+    await start($)
+    const ui = await mount($)
+    await ui.post({ kind: 'press', id: 'C:/p/src', button: 'left' })
+    await ui.post({ kind: 'press', id: 'C:/p/src/lib', button: 'left' })
+    expect((await rowOf(ui, 'C:/p/src/lib/x.ts')).segs.at(-1)).toEqual({ text: ' ?', color: 'success', bold: true })
+  })
+
+  test('a deleted file is struck; a glow beats the git color but not the cell', async ($, on) => {
+    const w = { ...PROJECT(), git: repo(() => Z('## main', ' D b.md', ' M src/a.ts')) }
+    const { clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    expect(await nameSeg(ui, 'C:/p/b.md', 'b.md')).toEqual({ text: 'b.md', color: 'error', strike: true })
+    w.git = repo()
+    await ui.press({ key: 'refresh' })
+    await call($, clock, readOf('C:/p/b.md'))
+    expect((await glowOf(ui))['C:/p/b.md']).toEqual({ color: 'autoAccept', glow: 'bright' })
+    expect((await rowOf(ui, 'C:/p/b.md')).segs.at(-1)).toEqual({ text: ' M', color: 'warning', bold: true })
+  })
+
+  test('a failed status keeps the last read; a failed diff leaves no +a -d', async ($, on) => {
+    const w = REPO()
+    world(on, w)
+    await start($)
+    const ui = await mount($)
+    w.git = sub => (sub === 'status' ? { exitCode: 1 } : repo()(sub))
+    await ui.press({ key: 'refresh' })
+    expect((await rowOf(ui, 'C:/p/b.md')).segs.at(-1)).toEqual({ text: ' M', color: 'warning', bold: true })
+    w.git = sub => (sub === 'diff' ? 'reject' : repo()(sub))
+    await ui.press({ key: 'refresh' })
+    const b = (await rowOf(ui, 'C:/p/b.md')).segs.map(s => s.text).join('')
+    expect(b).not.toContain('+3')
+    expect(b).toMatch(/\d{2}:\d{2} M$/)
+  })
+})
+
+describe('the branch row (spec-03 R6)', () => {
+  test('branch, ahead, behind, upstream and the root totals, on the terminal and the desktop', async ($, on) => {
+    world(on, REPO())
+    await start($)
+    const ui = await mount($)
+    const shown = await texts(ui)
+    for (const t of ['⑂ ', 'main', ' ↑1', ' ↓2', ' origin/main', ' +3', ' -1', ' ?:1', ' M:1']) expect(shown).toContain(t)
+    expect(shown).not.toContain(' clean')
+    expect((await ui.find({ type: 'Text', text: 'origin/main' }))?.props.wrap).toBe('truncate-end')
+    await ui.unmount()
+    expect(await texts(await mount($, 'desktop'))).toContain(' origin/main')
+  })
+
+  test('detached, clean, and one row fewer for the tree', async ($, on) => {
+    const many: World = {
+      cwd: 'C:/m',
+      dirs: { 'C:/m': Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`f${String(i).padStart(4, '0')}.txt`, 'file' as const])) },
+      git: sub => (sub === 'rev-parse' ? '\nC:/m\n' : sub === 'status' ? Z('## HEAD (no branch)') : ''),
+    }
+    world(on, many)
+    await start($, 'C:/m')
+    const ui = await mount($, 'terminal', pane(60, 20))
+    const shown = await texts(ui)
+    expect(shown).toContain('detached')
+    expect(shown).toContain(' clean')
+    expect((await rowsOf(ui)).rows).toHaveLength(17)
+  })
+})
+
+describe('when git is read (spec-03 R4, G2, G3)', () => {
+  test('every trigger reads git', async ($, on) => {
+    const { log, clock } = world(on, REPO())
+    await start($)
+    const ui = await mount($)
+    expect(reads(log)).toBe(1)
+    await ui.press({ key: 'refresh' })
+    expect(reads(log)).toBe(2)
+    await $.ui.focus({ component: 'Pane', requestId: 'filetree', origin: { kind: 'person' } } as any)
+    expect(reads(log)).toBe(3)
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' } as any)
+    await clock.settle()
+    expect(reads(log)).toBe(4)
+    await call($, clock, { tool: 'Write', file_path: 'C:\\p\\b.md', content: 'x' })
+    expect(reads(log)).toBe(5)
+    await call($, clock, shell('New-Item x.txt'))
+    expect(reads(log)).toBe(6)
+    await run($, 'C:/q')
+    expect(reads(log)).toBe(7)
+  })
+
+  test('requests during a read join into one more read', async ($, on) => {
+    const w = REPO()
+    const { log, clock } = world(on, w)
+    await start($)
+    log.runs.length = 0
+    w.gitDelays = { status: [1000] }
+    const turn = () => $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as any)
+    await turn()
+    await clock.settle()
+    await turn()
+    await turn()
+    await clock.settle()
+    expect(reads(log)).toBe(1)
+    await clock.advance(1000)
+    await clock.settle()
+    expect(reads(log)).toBe(2)
+  })
+
+  // The test engine runs one event at a time, so a reroot cannot land in the middle of a read
+  // there. Straight from `register`, the test holds each git call and reads the state itself.
+  test('a read that outlives a reroot is dropped', async () => {
+    const { hooks, $, state } = direct()
+    const flush = async () => {
+      for (let i = 0; i < 200; i++) await Promise.resolve()
+    }
+    let status = Z('## main', ' M b.md')
+    let hold: Promise<void> | null = null
+    const nouns = $ as any
+    nouns.ui = { panes: async () => [], open: async () => ({ isPlaced: true }), toast: () => undefined }
+    nouns.process = {
+      run: async (argv: string[]) => {
+        const sub = argv[6]
+        // What git saw when it started; a hold only delays the answer.
+        const out = sub === 'rev-parse' ? (argv[5] === 'C:\\p' ? '\nC:/p\n' : null) : sub === 'status' ? status : ''
+        const wait = sub === 'status' ? hold : null
+        if (wait) await wait
+        return { exitCode: out === null ? 128 : 0, stdout: out ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+      },
+    }
+    const gate = () => {
+      let open = () => {}
+      const p = new Promise<void>(r => (open = r))
+      return { p, open }
+    }
+    const letter = () => (state.git as any)?.status['c:/p/b.md']
+    const cwdTo = (p: string) => hooks['classic.CwdChanged']($, { new_cwd: p }, async () => ({}))
+
+    await hooks['session.start']($, { cwd: 'C:\\p' }, async () => ({}))
+    expect(letter()).toBe('M')
+
+    // Read A starts on C:/p and sees D; it is held while the cwd goes to C:/q and back to C:/p.
+    const a = gate()
+    hold = a.p
+    status = Z('## main', ' D b.md')
+    void hooks['turn.complete']($, { answer: '' }, async () => ({ text: '' }))
+    await flush()
+    const b = gate()
+    hold = b.p
+    void cwdTo('C:\\q')
+    await flush()
+    void cwdTo('C:\\p')
+    await flush()
+    status = Z('## main', 'A  b.md')
+
+    // A ends under another generation and writes nothing; B, which started after it, sees A.
+    a.open()
+    await flush()
+    expect(letter()).toBe('M')
+    b.open()
+    await flush()
+    expect(letter()).toBe('A')
+  })
+
+  test('the pane draws while git hangs, with no extra row until the first read', async ($, on) => {
+    const { clock } = world(on, { ...REPO(), gitDelays: { 'rev-parse': [10_000] } })
+    void start($)
+    await clock.settle()
+    const ui = await mount($)
+    expect(await names(ui)).toContain('· b.md')
+    expect((await texts(ui)).some(t => t === 'main' || t.startsWith('±'))).toBe(false)
+    await clock.advance(10_000)
+    await clock.settle()
+    expect(await texts(ui)).toContain('main')
   })
 })

@@ -57,6 +57,7 @@ const Rows: ClientModule<RowsProps, Local> = (props, surface) => {
       {...(seg.color ? { color: seg.color } : {})}
       {...(seg.bold ? { weight: 'bold' as const } : {})}
       {...(seg.dim ? { dimColor: true } : {})}
+      {...(seg.strike ? { strikethrough: true } : {})}
       {...(active ? { inverse: true } : {})}
     >
       {seg.text}

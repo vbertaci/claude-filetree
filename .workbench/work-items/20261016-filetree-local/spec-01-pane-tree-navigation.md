@@ -169,7 +169,7 @@ Voltar para uma pasta deve restaurar as pastas que estavam abertas nela durante 
 - R9.1. Quando o Client enviar `{ kind: 'key' }`, o mod deve aplicar a tabela [Teclas](#teclas) e ignorar as teclas que não estão nela.
 - R9.2. Quando o Client enviar um `press` esquerdo sem modificador numa pasta, o mod deve mover o cursor para ela e alternar a expansão.
 - R9.3. Quando o Client enviar um `press` esquerdo sem modificador num nó que não é pasta, o mod deve mover o cursor e marcar o nó como `selected`.
-- R9.4. Quando dois `press` esquerdos no mesmo id chegarem com até 450 ms de intervalo, num nó `dir`, o mod deve re-enraizar nele com `follow = false`. Num nó que não é pasta, deve se comportar como R9.3. A abertura de arquivos é da spec-05.
+- R9.4. Quando dois `press` esquerdos no mesmo id chegarem com até 450 ms de intervalo, num nó `dir`, o mod deve re-enraizar nele com `follow = false`. Num nó que não é pasta, deve se comportar como R9.3. A abertura de arquivos é da spec-06.
 - R9.5. Quando chegar um `press` esquerdo com `ctrl` ou `shift` numa pasta, o mod deve re-enraizar nela com `follow = false`.
 - R9.6. Quando chegar um `press` direito, o mod deve copiar o caminho relativo à raiz, na forma nativa, com `$.ui.copy`, e mostrar o toast `Copied <caminho>`. Com `shift`, deve copiar o caminho absoluto nativo.
 - R9.7. Se `$.ui.copy` falhar, o mod deve mostrar o toast `Could not copy the path`.
@@ -366,7 +366,7 @@ Chaves de `ClientKeyEvent.key`. A coluna "Original" indica paridade.
 | `home` / `end` | primeira / última linha | igual |
 | `right`, `l` | expande uma pasta fechada; noutro caso, nada | igual |
 | `left`, `h` | recolhe uma pasta aberta; noutro caso, cursor para a pasta-mãe, exceto quando a mãe é a raiz | igual |
-| `return`, `space` | pasta: alterna; outro nó: marca `selected` | arquivo: abre (spec-05); `space`: Quick Look no macOS |
+| `return`, `space` | pasta: alterna; outro nó: marca `selected` | arquivo: abre (spec-06); `space`: Quick Look no macOS |
 | `y` | copia o caminho relativo | igual |
 | `Y`, ou `y` com `shift` | copia o caminho absoluto | igual |
 
@@ -673,10 +673,10 @@ Verificação manual, numa sessão real com o mod carregado via `CLAUDE_CODE_PLU
 
 ## Out of scope
 
-- Brilho de atividade e seguir o Claude: spec-02. Chips de atividade (só de git): spec-03.
+- Brilho de atividade e seguir o Claude: spec-02. Chips de atividade (só de git): spec-04.
 - Status do git e linha de branch: spec-03.
-- Busca, tamanhos, idade, glyphs Nerd Font e dicas de hover nos botões: spec-04.
-- Abrir arquivo, preview e edição: spec-05. Aqui, duplo clique e `return` em arquivo só selecionam.
-- Contexto da seleção no prompt e `@menções`: spec-06.
-- Realce da linha sob o mouse (hover): fica para a spec-04, junto das dicas de hover.
+- Busca, tamanhos, idade, glyphs Nerd Font e dicas de hover nos botões: spec-05.
+- Abrir arquivo, preview e edição: spec-06. Aqui, duplo clique e `return` em arquivo só selecionam.
+- Contexto da seleção no prompt e `@menções`: spec-07.
+- Realce da linha sob o mouse (hover): fica para a spec-05, junto das dicas de hover.
 - Persistir a memória de expansão entre sessões (adiado).

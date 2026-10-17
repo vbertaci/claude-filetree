@@ -1,6 +1,6 @@
 {
   "name": "filetree-local",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "IDE-style file tree pane for Claude Code, local build",
   "author": { "name": "w4rl0ck" },
   "types": "./types/index.d.ts",
@@ -23,6 +23,13 @@
       "type": "string",
       "title": "Follow Claude",
       "description": "on: the tree scrolls to what Claude reads or writes and stays there. off: the view stays where you put it; highlights still show.",
+      "default": "on",
+      "options": ["on", "off"]
+    },
+    "hints": {
+      "type": "string",
+      "title": "Hints",
+      "description": "on: outside a git repo, a line under the header says git status starts after git init. off: the line is hidden and the tree gets the row.",
       "default": "on",
       "options": ["on", "off"]
     }

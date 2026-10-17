@@ -134,6 +134,13 @@ export function paths(platform: Platform): Paths {
   }
 }
 
+/** Executables the mod may run (spec-00 R1.2). Only this module picks by platform. */
+export const EXECUTABLES = { git: { windows: 'git.exe', posix: 'git' } } as const
+
+export function executable(name: keyof typeof EXECUTABLES, platform: Platform): string {
+  return EXECUTABLES[name][platform]
+}
+
 export async function detectPlatform($: EngineInterface): Promise<Platform> {
   return (await $.env.get('OS')) === 'Windows_NT' ? 'windows' : 'posix'
 }

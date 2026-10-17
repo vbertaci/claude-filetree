@@ -5,6 +5,7 @@ import type {
   EngineInterface,
   FsEntry,
   FsStat,
+  ProcessRunResult,
   Register,
   RenderSurface,
   Timer,
@@ -12,7 +13,7 @@ import type {
   ToolCallResult,
 } from 'claude-code'
 
-import type { ActivityState, ExpansionMemory, RowsMessage, Tone } from '../types'
+import type { ActivityState, ExpansionMemory, GitState, RowsMessage, Tone } from '../types'
 import {
   FLASH_MS,
   SCAN_LIT_LIMIT,
@@ -27,7 +28,20 @@ import {
   settingsOf,
   touchOf,
 } from './activity'
-import { type Paths, detectHome, detectPlatform, paths as makePaths } from './os'
+import {
+  DIFF_ARGS,
+  type GitSub,
+  STATUS_ARGS,
+  UNTRACKED_DIR_LIMIT,
+  emptyGit,
+  gitArgv,
+  parseNumstat,
+  parsePrefix,
+  parseStatus,
+  rollCounts,
+  rollUp,
+} from './git'
+import { type Paths, detectHome, detectPlatform, executable, paths as makePaths } from './os'
 import { layoutPane, renderPane, rootLabel } from './pane'
 import {
   type Effect,
@@ -54,6 +68,7 @@ const TOO_NARROW = 'filetree needs a terminal at least 110 columns wide. Widen i
 const treeAtom = atom({ plugin: 'filetree-local', key: 'tree' }, emptyTree('', true))
 const memoryAtom = atom({ plugin: 'filetree-local', key: 'memory' }, {} as ExpansionMemory)
 const activityAtom = atom({ plugin: 'filetree-local', key: 'activity' }, emptyActivity())
+const gitAtom = atom({ plugin: 'filetree-local', key: 'git' }, emptyGit())
 
 /** What a shell call's scan compares against, taken before the call runs (R6.1). */
 type Snapshot = { since: number; generation: number; dirs: string[]; names: Map<string, Set<string>> }
@@ -73,6 +88,10 @@ let glowTimer: Timer | null = null
 let glowSeq = 0
 /** Activity work, one tool call at a time in the order the calls ended (R6.5). */
 let queue: Promise<void> = Promise.resolve()
+let hints = true
+/** The git read running, and the one queued behind it (spec-03 R4.2). */
+let gitRun: Promise<void> | null = null
+let gitNext: Promise<void> | null = null
 
 // A refused call reads "<plugin>: $.fs.list: EACCES: ..."; the person needs only the reason.
 const message = (err: unknown): string => (err instanceof Error ? err.message : String(err)).replace(/^[\w-]+: \$\.[\w.]+: /, '')
@@ -129,6 +148,86 @@ async function refresh($: EngineInterface) {
   const t = await read($, treeAtom)
   const loaded = t.expanded.filter(id => t.nodes.find(n => n.id === id)?.loaded)
   await loadInDepthOrder($, loaded)
+  await refreshGit($)
+}
+
+/** The only caller of $.process.run in the mod: git, by argv, with the fixed flags (spec-03 R1). */
+async function runGit($: EngineInterface, root: string, sub: GitSub, args: readonly string[], timeoutMs: number) {
+  return $.process.run(gitArgv(executable('git', paths.platform), paths, root, sub, args), { timeoutMs })
+}
+
+/** Reads the repository that holds the root into `git`; a read that outlives a reroot is dropped (spec-03 R2–R4). */
+async function readGit($: EngineInterface) {
+  const { root, generation } = await read($, treeAtom)
+  if (root === '') return
+  const current = async () => (await read($, treeAtom)).generation === generation
+  const save = (g: GitState) => update($, gitAtom, () => g)
+
+  let probe: ProcessRunResult
+  try {
+    probe = await runGit($, root, 'rev-parse', ['--show-prefix', '--show-toplevel'], 5_000)
+  } catch {
+    if (await current()) await save({ ...emptyGit(), root, available: false })
+    return
+  }
+  const found = probe.exitCode === 0 ? parsePrefix(probe.stdout, paths) : null
+  if (found === null) {
+    if (await current()) await save({ ...emptyGit(), root })
+    return
+  }
+
+  // A status that fails keeps the last read of this root (R3.10).
+  const status = await runGit($, root, 'status', STATUS_ARGS, 20_000).catch(() => null)
+  if (status === null || status.exitCode !== 0) return
+  const ctx = { paths, root, prefix: found.prefix }
+  const parsed = parseStatus(status.stdout, ctx)
+
+  const changes = { ...parsed.changes }
+  if (parsed.untracked.length > 0) {
+    const rels = parsed.untracked.slice(0, UNTRACKED_DIR_LIMIT).map(id => paths.relative(root, id) || '.')
+    const others = await runGit($, root, 'ls-files', ['-o', '--exclude-standard', '-z', '--', ...rels], 10_000).catch(() => null)
+    if (others?.exitCode === 0) for (const rel of others.stdout.split('\0').filter(Boolean)) changes[paths.norm(paths.join(root, rel))] = 'new'
+  }
+  let diff: Record<string, [number, number]> = {}
+  if (!parsed.branch?.unborn) {
+    const run = await runGit($, root, 'diff', DIFF_ARGS, 20_000).catch(() => null)
+    if (run?.exitCode === 0) diff = parseNumstat(run.stdout, ctx)
+  }
+  // A new file shows its letter, not +N (R3.7).
+  const fresh = new Set(Object.keys(changes).filter(id => changes[id] === 'new').map(id => paths.key(id)))
+  for (const k of Object.keys(diff)) if (fresh.has(k)) delete diff[k]
+
+  if (!(await current())) return
+  await save({
+    root,
+    top: found.top,
+    prefix: found.prefix,
+    available: true,
+    status: parsed.status,
+    changes,
+    ignored: parsed.ignored,
+    untracked: parsed.untracked,
+    branch: parsed.branch,
+    diff: rollUp(diff, ctx),
+    counts: rollCounts(changes, ctx),
+  })
+}
+
+/** One read at a time; a request during a read waits for the next one, which starts after it (R4.2). */
+function refreshGit($: EngineInterface): Promise<void> {
+  if (gitRun === null) {
+    gitRun = readGit($)
+      .catch(() => undefined)
+      .finally(() => {
+        gitRun = null
+      })
+    return gitRun
+  }
+  gitNext ??= gitRun.then(() => {
+    gitNext = null
+    return refreshGit($)
+  })
+  return gitNext
 }
 
 /** Lists the parent folder of each id, where that folder is loaded (R3.3). */
@@ -243,8 +342,10 @@ async function observe($: EngineInterface, e: ToolCallInput, result: ToolCallRes
   } else if (touch.kind === 'write') {
     if (settings.writes) await reveal($, touch.ids, 'write')
     else await relistParents($, touch.ids)
+    void refreshGit($).catch(() => undefined)
   } else if (before) {
     await scan($, before)
+    void refreshGit($).catch(() => undefined)
   }
 }
 
@@ -264,6 +365,7 @@ async function reroot($: EngineInterface, root: string, opts: { follow: boolean;
   await update($, treeAtom, t => ({ ...emptyTree(root, t.showHidden), follow: opts.follow, generation: t.generation + 1, expanded }))
   await showPane($, opts)
   await loadInDepthOrder($, expanded)
+  await refreshGit($)
 }
 
 async function cwd($: EngineInterface): Promise<string> {
@@ -374,6 +476,7 @@ async function runFiletree($: EngineInterface, e: CommandRunInput): Promise<Comm
 
 export const register: Register = (on, options) => {
   settings = settingsOf(options)
+  hints = options.hints !== 'off'
 
   on('session.start', async ($, e, next) => {
     paths = makePaths(await detectPlatform($))
@@ -392,6 +495,7 @@ export const register: Register = (on, options) => {
     if (isFirst) {
       if (options.start !== 'off') await showPane($, { open: true })
       await listDir($, root)
+      await refreshGit($)
     }
     // A reload in the middle of a glow lost its timer: the glow still ends on time (R5.8).
     const { until } = await read($, activityAtom)
@@ -434,12 +538,14 @@ export const register: Register = (on, options) => {
     const t = await read($, treeAtom)
     const activity = await read($, activityAtom)
     const glow = isLive(activity, t.root, await $.clock.now()) ? { lit: activity.lit, focus: settings.follow ? activity.focus : null } : null
-    const layout = layoutPane(t, { surface: e.surface, bodyColumns: e.props.bodyColumns, bodyRows: e.props.scroll.bodyRows }, glow)
+    const g = await read($, gitAtom)
+    const git = g.root === t.root ? { state: g, hints } : null
+    const layout = layoutPane(t, { surface: e.surface, bodyColumns: e.props.bodyColumns, bodyRows: e.props.scroll.bodyRows }, glow, git, paths)
     view = { from: layout.from, max: layout.max }
     // The focus goes back to `open` after a nav button; a ring that cannot move is no failure.
     const nav = (k: KeyInput['key']) =>
       key($, { key: k }, e.surface).then(() => $.ui.focus({ requestId: PANE, key: 'nav-o' }).catch(() => undefined))
-    return renderPane($, e, paths, t, layout, {
+    return renderPane($, e, paths, t, layout, git, {
       up: async () => {
         const up = paths.parent(t.root)
         if (up !== null) await reroot($, up, { follow: false, open: false })

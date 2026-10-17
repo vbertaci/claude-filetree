@@ -55,7 +55,7 @@ A fatia está pronta quando:
   - Com `on`, cada destaque volta a rolagem para automática e centraliza a última linha acesa. Linhas acesas acima da janela ficam fixadas no topo (até 1/3).
   - Quando o destaque acaba, a janela volta para o cursor.
   - Com `off`, a linha do topo fica estável quando pastas se abrem (`keepTop`).
-- **Git.** Chips de git (`committing…`, `committed a1b2c3d`), verde em arquivos commitados ou preparados e tom da linha da branch. Ficam para a spec-03.
+- **Git.** Chips de git (`committing…`, `committed a1b2c3d`), verde em arquivos commitados ou preparados e tom da linha da branch. Ficam para a spec-04, que usa o status do git da spec-03.
 - **Segundo plano.** Comandos em segundo plano são acompanhados lendo `<task-notification>` no texto do `prompt.submit` seguinte.
 
 Esta fatia muda deliberadamente quatro pontos:
@@ -531,9 +531,9 @@ sequenceDiagram
 
 | Decision | Chosen | Rejected alternative | Why, and what it costs |
 |---|---|---|---|
-| Git na atividade | Chips, verde e tom da branch vão para a spec-03 | Chip genérico por ferramenta; chips só por `gitOperation` | No original, só o git gera chips. O verde precisa de git status. Esta fatia não tem chips |
+| Git na atividade | Chips, verde e tom da branch vão para a spec-04 | Chip genérico por ferramenta; chips só por `gitOperation` | No original, só o git gera chips. O verde precisa de git status. Esta fatia não tem chips |
 | Leituras pelo shell | Só `Read`, `Grep` e `Glob` acendem | Parser de Bash e PowerShell; ler só a saída do `rg`/`Select-String` | Elimina o código mais frágil e a exigência da spec-00 de classificar PowerShell. `Get-Content x` não acende |
-| Escritas pelo shell | Observar `mtimeMs` e nomes novos nas pastas abertas, pulando `isReadOnly` | Parser de alvos de escrita; nada até a spec-03 | Funciona sem git e sem parser. Não vê mudanças em pastas fechadas |
+| Escritas pelo shell | Observar `mtimeMs` e nomes novos nas pastas abertas, pulando `isReadOnly` | Parser de alvos de escrita; nada até a spec-04 | Funciona sem git e sem parser. Não vê mudanças em pastas fechadas |
 | Visual | Faixa animada de 2700 ms, `autoAccept`/`claude` com `dimColor` | Cor fixa; cor fixa mais marcador | É a assinatura do original. O custo fica num timer do Client |
 | Revelação | Abre os ancestrais e eles ficam abertos | Fechar depois; não abrir | Paridade e simplicidade. ⊟ fecha tudo |
 | Limite de busca | 60 arquivos por `Grep`/`Glob` | 12; só os já visíveis | Escolha do autor, igual ao original |
@@ -600,7 +600,7 @@ Verificação manual, numa sessão real com o mod carregado:
 
 ## Out of scope
 
-- **Atividade de git (spec-03).**
+- **Atividade de git (spec-04, sobre o status da spec-03).**
   - Chips `committing…` → `committed <sha>` (e os demais verbos de `git` e `gh`) no rodapé.
   - Verde nos arquivos commitados ou preparados.
   - Tom da linha da branch.

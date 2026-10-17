@@ -58,10 +58,50 @@ export type ActivityState = {
   until: number
 }
 
-/** Shapes shared between pane.tsx and the rows.tsx Client. */
-export type ThemeKeyName = 'text' | 'subtle' | 'suggestion' | 'error' | 'claude' | 'autoAccept'
+export type GitLetter = 'U' | 'D' | 'M' | 'T' | 'R' | 'C' | 'A' | '?'
 
-export type Seg = { text: string; color?: ThemeKeyName; bold?: true; dim?: true; glow?: 'bright' | 'faint' }
+export type Change = 'new' | 'mod' | 'del'
+
+export type Branch = {
+  /** Branch name; 'detached' without a branch. */
+  head: string
+  /** '' without an upstream. */
+  upstream: string
+  ahead: number
+  behind: number
+  detached: boolean
+  /** "No commits yet": there is no HEAD to diff against. */
+  unborn: boolean
+}
+
+export type GitState = {
+  /** tree.root of the read; under another root nothing is drawn. '' before the first read. */
+  root: string
+  /** Paths.norm of the repository top; '' outside a repository. */
+  top: string
+  /** The root relative to the top, with a trailing '/'; '' when the root is the top. */
+  prefix: string
+  /** false when git could not be run. */
+  available: boolean
+  /** Paths.key → letter; files, folders and the root. */
+  status: Record<string, GitLetter>
+  /** Id (Paths.norm, as git spells it) → change; files only. */
+  changes: Record<string, Change>
+  /** Paths.key → [added, removed]; files, folders and the root. */
+  diff: Record<string, [number, number]>
+  /** Paths.key → [new, mod, del]; folders and the root. */
+  counts: Record<string, [number, number, number]>
+  /** Ids (Paths.norm) git ignores; membership compares by Paths.key. */
+  ignored: string[]
+  /** Ids (Paths.norm) of untracked folders. */
+  untracked: string[]
+  branch: Branch | null
+}
+
+/** Shapes shared between pane.tsx and the rows.tsx Client. */
+export type ThemeKeyName = 'text' | 'subtle' | 'suggestion' | 'error' | 'claude' | 'autoAccept' | 'success' | 'warning'
+
+export type Seg = { text: string; color?: ThemeKeyName; bold?: true; dim?: true; strike?: true; glow?: 'bright' | 'faint' }
 
 export type RowSpec = { id: string; segs: Seg[]; active: boolean }
 
@@ -87,6 +127,7 @@ declare module 'claude-code' {
       tree: TreeState
       memory: ExpansionMemory
       activity: ActivityState
+      git: GitState
     }
   }
 }
