@@ -1,4 +1,6 @@
-import type { Branch, Change, FileNode, GitLetter, GitState } from '../types'
+import type { BuiltinToolResults, ToolCallResult } from 'claude-code'
+
+import type { Branch, Change, FileNode, GitLetter, GitState, Tone } from '../types'
 import type { Paths } from './os'
 
 // Pure functions over git: the argv, the porcelain and what each node shows. Nothing here calls `$`.
@@ -8,9 +10,19 @@ export const GIT_FLAGS = ['--no-optional-locks', '-c', 'core.fsmonitor=false'] a
 export const UNTRACKED_DIR_LIMIT = 100
 export const STATUS_ARGS = ['--porcelain=v1', '-b', '-z', '--ignored=traditional', '--untracked-files=normal', '--', '.'] as const
 export const DIFF_ARGS = ['HEAD', '--numstat', '-z', '--no-ext-diff', '--no-textconv', '--', '.'] as const
+export const STAT_LIMIT = 4000
+export const STAT_BATCH = 50
+export const GREEN_LIMIT = 12
+export const CHIP_MS = 45_000
+/** The branch row's id in `activity.lit`; no node id is ever this, node ids are absolute paths. */
+export const BRANCH_ID = '#branch'
 
 /** The only subcommands the mod runs (spec-00 R1.2). */
-export type GitSub = 'rev-parse' | 'status' | 'diff' | 'ls-files'
+export type GitSub = 'rev-parse' | 'status' | 'diff' | 'ls-files' | 'diff-tree'
+
+export type GitOperation = NonNullable<BuiltinToolResults['Bash']['gitOperation']>
+
+export type ChipSpec = { icon: string; text: string; detail: string; tone: Tone }
 
 /** Where a git path lands in the tree: the root and the root's path relative to the top. */
 export type GitCtx = { paths: Paths; root: string; prefix: string }
@@ -23,12 +35,12 @@ export type NodeGit = {
 }
 
 /** What parseStatus returns; readGit adds the diff and the counts. */
-export type Parsed = Pick<GitState, 'status' | 'changes' | 'ignored' | 'untracked' | 'branch'>
+export type Parsed = Pick<GitState, 'status' | 'changes' | 'ignored' | 'untracked' | 'staged' | 'branch'>
 
 const PRIORITY: readonly GitLetter[] = ['U', 'D', 'M', 'T', 'R', 'C', 'A', '?']
 
 export function emptyGit(): GitState {
-  return { root: '', top: '', prefix: '', available: true, status: {}, changes: {}, diff: {}, counts: {}, ignored: [], untracked: [], branch: null }
+  return { root: '', top: '', prefix: '', available: true, status: {}, changes: {}, diff: {}, counts: {}, ignored: [], untracked: [], staged: [], branch: null }
 }
 
 /** The root only ever goes in as the value of -C; paths go after a `--` in `args` (R1.3). */
@@ -90,7 +102,7 @@ export function parseBranch(record: string): Branch {
 /** `status --porcelain=v1 -b -z`; a cut last record has no NUL after it and is dropped. */
 export function parseStatus(stdout: string, ctx: GitCtx): Parsed {
   const { paths } = ctx
-  const out: Parsed = { status: {}, changes: {}, ignored: [], untracked: [], branch: null }
+  const out: Parsed = { status: {}, changes: {}, ignored: [], untracked: [], staged: [], branch: null }
   const mark = (id: string, letter: GitLetter) => {
     out.status[paths.key(id)] = stronger(out.status[paths.key(id)], letter)
     for (const dir of foldersAbove(ctx, id)) out.status[paths.key(dir)] = stronger(out.status[paths.key(dir)], letter)
@@ -118,6 +130,8 @@ export function parseStatus(stdout: string, ctx: GitCtx): Parsed {
     if (letter === undefined) continue
     if (xy === '??' && raw.endsWith('/')) out.untracked.push(id)
     else out.changes[id] = changeOf(xy)
+    // Column X is the index; a conflict is not a staged change (spec-04 R3.3).
+    if ('MADRCT'.includes(xy[0]!) && !isConflict(xy)) out.staged.push(id)
     mark(id, letter)
   }
   return out
@@ -201,4 +215,105 @@ export function gitOf(g: GitState, paths: Paths, node: FileNode): NodeGit {
     ...(diff ? { diff } : {}),
     ...(counts ? { counts } : {}),
   }
+}
+
+// ---- git activity (spec-04): what a shell command did, without reading the command ----
+
+/** Before and after are reads of the same repository for the current root. */
+export function sameRepo(before: GitState, after: GitState, root: string): boolean {
+  return before.root === root && after.root === root && before.top !== '' && before.top === after.top
+}
+
+/**
+ * Dirty files after the command, in their order: `fresh` were not dirty before (or were deleted),
+ * `touched` were, and count only if their date moved (spec-04 R2.1).
+ */
+export function gitCandidates(before: GitState, after: GitState, paths: Paths): { fresh: string[]; touched: string[] } {
+  const was = new Map(Object.entries(before.changes).map(([id, c]) => [paths.key(id), c]))
+  const fresh: string[] = []
+  const touched: string[] = []
+  for (const [id, change] of Object.entries(after.changes)) {
+    if (change === 'del') continue
+    const old = was.get(paths.key(id))
+    if (old === undefined || old === 'del') fresh.push(id)
+    else touched.push(id)
+  }
+  return { fresh, touched }
+}
+
+/** Ids staged after the command that were not staged before (spec-04 R3.3). */
+export function newlyStaged(before: GitState, after: GitState, paths: Paths): string[] {
+  const was = new Set(before.staged.map(id => paths.key(id)))
+  return after.staged.filter(id => !was.has(paths.key(id)))
+}
+
+/** A sha can go into the argv: hex only, so never read as an option (spec-04 R7.2). */
+export function isSha(s: string): boolean {
+  return /^[0-9a-f]{7,64}$/i.test(s)
+}
+
+/** `diff-tree --name-only -z`: the paths, as ids under the root. */
+export function parseNames(stdout: string, ctx: GitCtx): string[] {
+  return stdout
+    .split('\0')
+    .filter(Boolean)
+    .flatMap(rel => idOf(ctx, rel) ?? [])
+}
+
+/** The engine's own account of a git command, read defensively: the record is the tool's. */
+export function gitOperationOf(result: ToolCallResult): GitOperation | undefined {
+  const record = result.result
+  if (typeof record !== 'object' || record === null) return undefined
+  const op = (record as Record<string, unknown>).gitOperation
+  return typeof op === 'object' && op !== null ? (op as GitOperation) : undefined
+}
+
+const PR_TEXT: Record<string, string> = {
+  created: 'opened PR',
+  merged: 'merged PR',
+  commented: 'commented on PR',
+  closed: 'closed PR',
+  reopened: 'reopened PR',
+}
+
+const COMMIT_CHIP: Record<string, { icon: string; tone: Tone }> = {
+  committed: { icon: '●', tone: 'commit' },
+  amended: { icon: '●', tone: 'commit' },
+  'cherry-picked': { icon: '⑃', tone: 'merge' },
+}
+
+/** The command's chips in the order of the spec's table; the last one is shown (spec-04 R4.1). */
+export function chipsOf(op: GitOperation | undefined, staged: readonly string[], before: GitState, after: GitState, repo: boolean): ChipSpec[] {
+  const chips: ChipSpec[] = []
+  if (!op?.commit && repo && staged.length > 0) chips.push({ icon: '±', text: `staged ${staged.length}`, detail: '', tone: 'commit' })
+  if (op?.commit) {
+    const look = COMMIT_CHIP[op.commit.kind] ?? COMMIT_CHIP.committed!
+    chips.push({ icon: look.icon, text: op.commit.kind, detail: op.commit.sha.slice(0, 7), tone: look.tone })
+  }
+  if (op?.branch) chips.push({ icon: '⑃', text: op.branch.action, detail: op.branch.ref, tone: 'merge' })
+  if (op?.push) chips.push({ icon: '↑', text: 'pushed', detail: op.push.branch, tone: 'sync' })
+  if (op?.pr) {
+    const known = PR_TEXT[op.pr.action]
+    const text = known ? `${known} #${op.pr.number}` : `PR #${op.pr.number} ${op.pr.action.replace(/-/g, ' ')}`
+    chips.push({ icon: '⇄', text, detail: '', tone: 'merge' })
+  }
+  if (repo && before.branch && after.branch && before.branch.head !== after.branch.head) {
+    chips.push({ icon: '⑂', text: 'switched to', detail: after.branch.head, tone: 'sync' })
+  }
+  return chips
+}
+
+/** The branch row's tone: the last chip's, or sync when ahead/behind moved on the same branch (spec-04 R6.1). */
+export function branchToneOf(chips: readonly ChipSpec[], before: GitState, after: GitState, repo: boolean): Tone | null {
+  const last = chips.at(-1)
+  if (last) return last.tone
+  const b = before.branch
+  const a = after.branch
+  if (repo && b && a && b.head === a.head && (b.ahead !== a.ahead || b.behind !== a.behind)) return 'sync'
+  return null
+}
+
+/** `<gitdir>/index` or `<gitdir>/HEAD`, a worktree's gitdir under `.git/worktrees/<name>/` too (spec-05 R2.4). */
+export function isGitWatch(p: string): boolean {
+  return /[\\/]\.git(?:[\\/]worktrees[\\/][^\\/]+)?[\\/](?:index|HEAD)$/i.test(p)
 }

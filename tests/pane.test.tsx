@@ -24,10 +24,12 @@ type World = {
   git?: (sub: string, argv: string[]) => GitAnswer
   /** Delays (ms) of successive git runs, by subcommand. */
   gitDelays?: Record<string, number[]>
+  /** The pane waits undrawn: open but not placed. */
+  unplaced?: boolean
 }
 /** A string is stdout with exit 0; 'reject' is a git that cannot start. */
 type GitAnswer = string | { exitCode: number; stdout?: string } | 'reject'
-type Log = { opens: any[]; closes: string[]; toasts: string[]; copies: string[]; lists: string[]; calls: any[]; runs: string[][] }
+type Log = { opens: any[]; closes: string[]; toasts: string[]; copies: string[]; lists: string[]; calls: any[]; runs: string[][]; stats: string[] }
 
 const N = (p: string) => p.replace(/\\/g, '/').replace(/^([a-z]):/, (_, d: string) => `${d.toUpperCase()}:`)
 const PLUGIN = 'filetree-local'
@@ -35,7 +37,7 @@ const ROOT = 'C:/p'
 const MTIME = 1_700_000_000_000
 
 function world(on: On, w: World) {
-  const log: Log = { opens: [], closes: [], toasts: [], copies: [], lists: [], calls: [], runs: [] }
+  const log: Log = { opens: [], closes: [], toasts: [], copies: [], lists: [], calls: [], runs: [], stats: [] }
   const open = new Set<string>()
   mock.env(on, { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\w4rl0ck' })
   const clock = mock.clock(on, { now: w.now ?? 1_000_000 })
@@ -48,7 +50,7 @@ function world(on: On, w: World) {
     open.add(e.id)
     return { value: { isPlaced: true } } as any
   })
-  on('ui.panes', () => ({ value: [...open].map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })) }) as any)
+  on('ui.panes', () => ({ value: [...open].map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: !w.unplaced })) }) as any)
   on('ui.close', (_$: any, e: any) => {
     log.closes.push(e.id)
     open.delete(e.id)
@@ -88,10 +90,11 @@ function world(on: On, w: World) {
   })
   on('fs.stat', (_$: any, e: any) => {
     const p = N(e.path)
+    log.stats.push(p)
     if (w.denied?.includes(p)) return { deny: `EACCES: permission denied, stat '${e.path}'` } as any
     if (w.dirs[p]) return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } } as any
     const cut = p.lastIndexOf('/')
-    if (w.dirs[p.slice(0, cut)]?.[p.slice(cut + 1)]) return { value: { kind: 'file', size: 1, mtimeMs: MTIME, isLink: false } } as any
+    if (w.dirs[p.slice(0, cut)]?.[p.slice(cut + 1)]) return { value: { kind: 'file', size: 1, mtimeMs: w.mtimes?.[p] ?? MTIME, isLink: false } } as any
     return { deny: `ENOENT: no such file or directory, stat '${e.path}'` } as any
   })
   on('process.run', async (_$: any, e: any) => {
@@ -588,7 +591,7 @@ function direct(state: Record<string, unknown> = {}) {
   }) as any, {})
   const versions: Record<string, number> = {}
   const nouns: Record<string, any> = {
-    clock: { now: async () => 1000, after: () => ({ cancel() {} }) },
+    clock: { now: async () => 1000, after: () => ({ cancel() {} }), every: () => ({ cancel() {} }) },
     env: { get: async (name: string) => (name === 'OS' ? 'Windows_NT' : undefined) },
     fs: { list: async () => [] },
     state: {
@@ -1287,5 +1290,558 @@ describe('when git is read (spec-03 R4, G2, G3)', () => {
     await clock.advance(10_000)
     await clock.settle()
     expect(await texts(ui)).toContain('main')
+  })
+})
+
+// ---- spec-04: git activity ----
+
+/** The clock when commands start; a file a command writes gets NEWER. */
+const SINCE = MTIME + 60_000
+const NEWER = SINCE + 1_000
+const bash = (command: string) => ({ tool: 'Bash', command })
+
+/**
+ * C:/p as a repository whose status a Bash command changes: `run` is what the command does to the
+ * disk and to git, `op` the engine's gitOperation, `names` what diff-tree answers.
+ */
+function gitWorld(over: Partial<World> = {}) {
+  const g = {
+    status: Z('## main', ' M b.md'),
+    names: '' as string | { exitCode: number },
+    op: undefined as unknown,
+    isError: false,
+    run: (_w: World) => {},
+  }
+  const w: World = {
+    ...PROJECT(),
+    now: SINCE,
+    git: sub => (sub === 'rev-parse' ? '\nC:/p\n' : sub === 'status' ? g.status : sub === 'diff-tree' ? g.names : ''),
+    ...over,
+  }
+  w.tool = () => {
+    g.run(w)
+    if (g.isError) return { isError: true, result: 'failed', text: 'failed' }
+    return answer({ stdout: '', ...(g.op ? { gitOperation: g.op } : {}) })
+  }
+  return { w, g }
+}
+/** The chip in the footer: what it shows in the tone's color, and its detail. */
+const chipOf = async (ui: any) => {
+  const all = await ui.findAll({ type: 'Text' })
+  const at = all.findIndex((t: any) => /^[●⑃↑⇄±⑂] \S/.test(t.text))
+  if (at < 0) return null
+  const next = all[at + 1]
+  return { text: all[at].text, color: all[at].props.color, detail: next?.props.color === 'subtle' && next.text.startsWith(' ') ? next.text : '' }
+}
+/** The branch name's Text on the branch row. */
+const branchName = async (ui: any, head = 'main') => {
+  const t = await ui.find({ type: 'Text', text: new RegExp(`^${head}$`) })
+  return { color: t?.props.color, weight: t?.props.weight }
+}
+
+describe('git write scan (spec-04 R1, R2)', () => {
+  test('a file written in a closed folder lights orange and opens the folders to it', async ($, on) => {
+    const { w, g } = gitWorld()
+    const { clock, log } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    g.run = w => {
+      w.dirs['C:/p/src/lib']!['new.txt'] = 'file'
+      w.mtimes = { 'C:/p/src/lib/new.txt': NEWER }
+      g.status = Z('## main', ' M b.md', '?? src/lib/new.txt')
+    }
+    const before = reads(log)
+    await call($, clock, bash('echo x > src/lib/new.txt'))
+    // The status it used came from a read after the command.
+    expect(reads(log)).toBe(before + 1)
+    expect(await glowOf(ui)).toEqual({
+      'C:/p/src': { color: 'claude', glow: 'faint' },
+      'C:/p/src/lib': { color: 'claude', glow: 'faint' },
+      'C:/p/src/lib/new.txt': { color: 'claude', glow: 'bright' },
+    })
+  })
+
+  test('a file already dirty lights only when its date moved', async ($, on) => {
+    const { w, g } = gitWorld()
+    g.status = Z('## main', ' M src/a.ts')
+    const { clock, log } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    await call($, clock, bash('npm test'))
+    expect(log.stats).toEqual(['C:/p/src/a.ts'])
+    expect(await glowOf(ui)).toEqual({})
+    g.run = w => (w.mtimes = { 'C:/p/src/a.ts': NEWER })
+    await call($, clock, bash('sed -i s/a/b/ src/a.ts'))
+    expect((await glowOf(ui))['C:/p/src/a.ts']).toEqual({ color: 'claude', glow: 'bright' })
+  })
+
+  test('a file in an open folder and in git lights once', async ($, on) => {
+    const { w, g } = gitWorld()
+    const { clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    g.run = w => (w.mtimes = { 'C:/p/b.md': NEWER })
+    await call($, clock, bash('echo x >> b.md'))
+    expect(await glowOf(ui)).toEqual({ 'C:/p/b.md': { color: 'claude', glow: 'bright' } })
+  })
+
+  test('at most 4000 stats a command', async ($, on) => {
+    const many = Array.from({ length: 4001 }, (_, i) => ` M f${String(i).padStart(4, '0')}.ts`)
+    const { w, g } = gitWorld()
+    g.status = Z('## main', ...many)
+    const { clock, log } = world(on, w)
+    await start($)
+    log.stats.length = 0
+    await call($, clock, bash('make'))
+    expect(log.stats).toHaveLength(4000)
+  })
+
+  test('activity reads: the scan only relists, and git is still read', { options: { activity: 'reads' } }, async ($, on) => {
+    const { w, g } = gitWorld()
+    const { clock, log } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    g.run = w => {
+      w.dirs['C:/p/src/lib']!['new.txt'] = 'file'
+      g.status = Z('## main', ' M b.md', '?? src/lib/new.txt')
+    }
+    const before = reads(log)
+    await call($, clock, bash('echo x > src/lib/new.txt'))
+    expect(reads(log)).toBe(before + 1)
+    expect(await glowOf(ui)).toEqual({})
+    expect(await names(ui)).not.toContain('▾ ■ src')
+  })
+
+  test('outside a repository only the folder scan of spec-02 counts', async ($, on) => {
+    const w: World = { ...PROJECT(), now: SINCE }
+    w.tool = () => {
+      w.dirs['C:/p/src/lib']!['new.txt'] = 'file'
+      return answer({ stdout: '', gitOperation: { commit: { sha: 'a1b2c3d4', kind: 'committed' } } })
+    }
+    const { clock, log } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    await call($, clock, bash('echo x > src/lib/new.txt'))
+    expect(await glowOf(ui)).toEqual({})
+    expect(log.stats).toEqual([])
+    expect(subs(log)).not.toContain('diff-tree')
+  })
+})
+
+describe('green, chips and the branch row (spec-04 R3, R4, R6)', () => {
+  test('a commit: diff-tree by its sha, its files green, the chip and the branch row', async ($, on) => {
+    const { w, g } = gitWorld()
+    g.status = Z('## main', ' M b.md', ' M src/a.ts')
+    const { clock, log } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    g.run = () => {
+      g.status = Z('## main')
+      g.op = { commit: { sha: 'a1b2c3d4e5f6', kind: 'committed' } }
+      g.names = Z('b.md', 'src/a.ts')
+    }
+    await call($, clock, bash('git commit -am x'))
+    expect(log.runs.filter(a => a[6] === 'diff-tree')).toEqual([
+      [...FLAGS, 'C:\\p', 'diff-tree', '--root', '--no-commit-id', '--name-only', '-r', '-z', '--no-ext-diff', '--no-textconv', 'a1b2c3d4e5f6'],
+    ])
+    expect(await glowOf(ui)).toEqual({
+      'C:/p/b.md': { color: 'success', glow: 'bright' },
+      'C:/p/src': { color: 'success', glow: 'faint' },
+      'C:/p/src/a.ts': { color: 'success', glow: 'bright' },
+    })
+    expect(await chipOf(ui)).toEqual({ text: '● committed', color: 'success', detail: ' a1b2c3d' })
+    expect(await branchName(ui)).toEqual({ color: 'success', weight: 'bold' })
+    await clock.advance(2700)
+    expect(await branchName(ui)).toEqual({ color: 'text', weight: 'bold' })
+  })
+
+  test('at most 12 green', async ($, on) => {
+    const { w, g } = gitWorld()
+    const files = Array.from({ length: 15 }, (_, i) => `g${String(i).padStart(2, '0')}.ts`)
+    for (const f of files) w.dirs[ROOT]![f] = 'file'
+    const { clock } = world(on, w)
+    await start($)
+    const ui = await mount($, 'terminal', pane(60, 40))
+    g.run = () => {
+      g.op = { commit: { sha: 'abcdef1234', kind: 'committed' } }
+      g.names = Z(...files)
+    }
+    await call($, clock, bash('git commit -m x'))
+    expect(Object.values(await glowOf(ui)).filter(v => v.color === 'success')).toHaveLength(12)
+  })
+
+  test('a sha that is not hex never reaches git; a failed diff-tree lights nothing', async ($, on) => {
+    const { w, g } = gitWorld()
+    const { clock, log } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    g.op = { commit: { sha: '--output=x', kind: 'committed' } }
+    await call($, clock, bash('git commit -m x'))
+    expect(subs(log)).not.toContain('diff-tree')
+    expect(await chipOf(ui)).toEqual({ text: '● committed', color: 'success', detail: ' --outpu' })
+    g.op = { commit: { sha: 'a1b2c3d4', kind: 'committed' } }
+    g.names = { exitCode: 128 }
+    await call($, clock, bash('git commit -m y'))
+    expect(subs(log)).toContain('diff-tree')
+    expect(Object.values(await glowOf(ui)).filter(v => v.glow === 'bright' && v.color === 'success')).toEqual([])
+    expect((await chipOf(ui))?.detail).toBe(' a1b2c3d')
+  })
+
+  test('git add: the newly staged go green, a new file in both lists ends green', async ($, on) => {
+    const { w, g } = gitWorld()
+    const { clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    g.run = w => {
+      w.dirs[ROOT]!['c.md'] = 'file'
+      w.mtimes = { 'C:/p/c.md': NEWER }
+      g.status = Z('## main', 'M  b.md', 'A  c.md')
+    }
+    await call($, clock, bash('git add -A'))
+    expect(await glowOf(ui)).toEqual({ 'C:/p/b.md': { color: 'success', glow: 'bright' }, 'C:/p/c.md': { color: 'success', glow: 'bright' } })
+    expect(await chipOf(ui)).toEqual({ text: '± staged 2', color: 'success', detail: '' })
+    expect(await branchName(ui)).toEqual({ color: 'success', weight: 'bold' })
+  })
+
+  test('push, switch, PR and the last chip winning', async ($, on) => {
+    const { w, g } = gitWorld()
+    g.status = Z('## main...origin/main [ahead 1]')
+    const { clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    g.run = () => (g.status = Z('## main...origin/main'))
+    g.op = { commit: { sha: 'a1b2c3d4', kind: 'committed' }, push: { branch: 'main' } }
+    await call($, clock, bash('git commit -m x && git push'))
+    expect(await chipOf(ui)).toEqual({ text: '↑ pushed', color: 'suggestion', detail: ' main' })
+    expect(await branchName(ui)).toEqual({ color: 'suggestion', weight: 'bold' })
+
+    g.op = undefined
+    g.run = () => (g.status = Z('## dev'))
+    await call($, clock, bash('git switch -c dev'))
+    expect(await chipOf(ui)).toEqual({ text: '⑂ switched to', color: 'suggestion', detail: ' dev' })
+
+    g.run = () => {}
+    g.op = { pr: { number: 12, action: 'created' } }
+    await call($, clock, bash('gh pr create'))
+    expect(await chipOf(ui)).toEqual({ text: '⇄ opened PR #12', color: 'merged', detail: '' })
+    expect(await branchName(ui, 'dev')).toEqual({ color: 'merged', weight: 'bold' })
+  })
+
+  test('ahead or behind moving with no chip lights the branch row in sync', async ($, on) => {
+    const { w, g } = gitWorld()
+    g.status = Z('## main...origin/main [behind 2]')
+    const { clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    g.run = () => (g.status = Z('## main...origin/main'))
+    await call($, clock, bash('git pull'))
+    expect(await chipOf(ui)).toBe(null)
+    expect(await branchName(ui)).toEqual({ color: 'suggestion', weight: 'bold' })
+  })
+
+  test('an error with no gitOperation makes no chip and lights no branch', async ($, on) => {
+    const { w, g } = gitWorld()
+    const { clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    g.isError = true
+    await call($, clock, bash('git commit -m x'))
+    expect(await chipOf(ui)).toBe(null)
+    expect(await branchName(ui)).toEqual({ color: 'text', weight: 'bold' })
+  })
+
+  test('activity none: the chip still shows, nothing glows', { options: { activity: 'none' } }, async ($, on) => {
+    const { w, g } = gitWorld()
+    const { clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    g.op = { push: { branch: 'main' } }
+    await call($, clock, bash('git push'))
+    expect(await chipOf(ui)).toEqual({ text: '↑ pushed', color: 'suggestion', detail: ' main' })
+    expect(await branchName(ui)).toEqual({ color: 'text', weight: 'bold' })
+  })
+})
+
+describe('chip lifetime and the footer (spec-04 R4.3–R4.5, R5, R6.3)', () => {
+  test('45 s from the latest chip; the older timer does not clear the newer chip; another root hides it', async ($, on) => {
+    const { w, g } = gitWorld()
+    const { clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    g.op = { push: { branch: 'main' } }
+    await call($, clock, bash('git push'))
+    await clock.advance(10_000)
+    g.op = { commit: { sha: 'a1b2c3d4', kind: 'committed' } }
+    await call($, clock, bash('git commit -m x'))
+    await clock.advance(35_000)
+    expect((await chipOf(ui))?.text).toBe('● committed')
+    await clock.advance(10_000)
+    expect(await chipOf(ui)).toBe(null)
+
+    g.op = { push: { branch: 'main' } }
+    await call($, clock, bash('git push'))
+    expect((await chipOf(ui))?.text).toBe('↑ pushed')
+    await run($, 'C:/q')
+    expect(await chipOf(ui)).toBe(null)
+  })
+
+  test('the footer: chip alone, with the selection, a row fewer for the tree, on the desktop too', async ($, on) => {
+    const files = Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`f${String(i).padStart(4, '0')}.txt`, 'file' as const]))
+    const w: World = { cwd: 'C:/m', dirs: { 'C:/m': files }, now: SINCE, git: sub => (sub === 'rev-parse' ? '\nC:/m\n' : sub === 'status' ? Z('## main') : '') }
+    w.tool = () => answer({ stdout: '', gitOperation: { push: { branch: 'main' } } })
+    const { clock } = world(on, w)
+    await start($, 'C:/m')
+    const ui = await mount($, 'terminal', pane(60, 20))
+    expect((await rowsOf(ui)).rows).toHaveLength(17)
+    await call($, clock, bash('git push'))
+    expect((await rowsOf(ui)).rows).toHaveLength(16)
+    expect(await ui.find({ type: 'Text', text: 'selected:' })).toBe(undefined)
+    expect((await chipOf(ui))?.text).toBe('↑ pushed')
+    await pressOpen(ui, 'C:/m/f0000.txt')
+    expect(await ui.find({ type: 'Text', text: 'selected: f0000.txt' })).toBeDefined()
+    expect((await chipOf(ui))?.text).toBe('↑ pushed')
+    await ui.unmount()
+    expect((await chipOf(await mount($, 'desktop')))?.text).toBe('↑ pushed')
+  })
+
+  test('the branch glow moves neither the cursor, the selection nor the window', async ($, on) => {
+    const { w, g } = gitWorld()
+    const { clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    await pressOpen(ui, 'C:/p/b.md')
+    const rows = JSON.stringify((await rowsOf(ui)).rows.map(r => [r.id, r.active]))
+    g.op = { push: { branch: 'main' } }
+    await call($, clock, bash('git push'))
+    expect(await branchName(ui)).toEqual({ color: 'suggestion', weight: 'bold' })
+    expect(JSON.stringify((await rowsOf(ui)).rows.map(r => [r.id, r.active]))).toBe(rows)
+    expect(await ui.find({ type: 'Text', text: 'selected: b.md' })).toBeDefined()
+    expect(await glowOf(ui)).toEqual({})
+  })
+
+  test('a reload with a chip set: one still due clears on time, one past due at once', async () => {
+    const chip = (at: number) => ({ root: 'C:/p', icon: '↑', text: 'pushed', detail: 'main', tone: 'sync', at })
+    // The stand-in clock reads 1000.
+    const due = direct({ chip: chip(1000 - 10_000) })
+    const after: Array<[number, () => void]> = []
+    ;(due.$ as any).clock = { now: async () => 1000, after: (ms: number, fn: () => void) => (after.push([ms, fn]), { cancel() {} }), every: () => ({ cancel() {} }) }
+    await due.hooks['session.start'](due.$, { cwd: 'C:\\p' }, async () => ({}))
+    expect(due.state.chip).not.toBe(null)
+    expect(after.map(([ms]) => ms)).toContain(35_000)
+    const past = direct({ chip: chip(1000 - 50_000) })
+    await past.hooks['session.start'](past.$, { cwd: 'C:\\p' }, async () => ({}))
+    expect(past.state.chip).toBe(null)
+  })
+})
+
+describe('git activity and the tool call (spec-04 G1, R1.4)', () => {
+  test('the result comes back before git is read', async ($, on) => {
+    const { w, g } = gitWorld()
+    const { clock, log } = world(on, w)
+    await start($)
+    w.gitDelays = { 'rev-parse': [10_000] }
+    g.op = { push: { branch: 'main' } }
+    const r = await $.tool.call(bash('git push') as any)
+    await clock.settle()
+    expect(r).toEqual(answer({ stdout: '', gitOperation: { push: { branch: 'main' } } }))
+    expect(subs(log).at(-1)).toBe('rev-parse')
+    await clock.advance(10_000)
+  })
+
+  test('a reroot while git is read drops the rest of the work', async ($, on) => {
+    const { w, g } = gitWorld()
+    const { clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    w.gitDelays = { status: [5_000] }
+    g.op = { push: { branch: 'main' } }
+    g.run = w => {
+      w.dirs['C:/p/src/lib']!['new.txt'] = 'file'
+      g.status = Z('## main', ' M b.md', '?? src/lib/new.txt')
+    }
+    await $.tool.call(bash('echo x > src/lib/new.txt && git push') as any)
+    await clock.settle()
+    void run($, 'C:/q')
+    await clock.settle()
+    await clock.advance(5_000)
+    await clock.settle()
+    expect(await glowOf(ui)).toEqual({})
+    expect(await chipOf(ui)).toBe(null)
+  })
+})
+
+// ---- spec-05: auto refresh ----
+
+const sessionStart = ($: any) =>
+  $.classic.SessionStart({ hook_event_name: 'SessionStart', session_id: 's', transcript_path: 't', cwd: 'C:\\p', source: 'startup' } as any)
+const fileChanged = ($: any, file_path: string) =>
+  $.classic.FileChanged({ hook_event_name: 'FileChanged', session_id: 's', transcript_path: 't', cwd: 'C:\\p', file_path, event: 'change' } as any)
+/** The repository of REPO, whose gitdir rev-parse also answers. */
+const withGitDir =
+  (status: () => string = () => STATUS) =>
+  (sub: string, argv: string[]): GitAnswer =>
+    sub === 'rev-parse' && argv[7] === '--absolute-git-dir' ? 'C:/p/.git\n' : repo(status)(sub)
+
+describe('reading again on a timer (spec-05 R1, R3)', () => {
+  test('every 5 s while the pane shows; a second start keeps one interval', async ($, on) => {
+    const { log, clock } = world(on, REPO())
+    await start($)
+    await mount($)
+    expect(reads(log)).toBe(1)
+    await clock.advance(15_000)
+    await clock.settle()
+    expect(reads(log)).toBe(4)
+    await start($)
+    await clock.advance(5_000)
+    await clock.settle()
+    expect(reads(log)).toBe(5)
+  })
+
+  test('refresh off: no timer', { options: { refresh: 'off' } }, async ($, on) => {
+    const { log, clock } = world(on, REPO())
+    await start($)
+    await clock.advance(30_000)
+    await clock.settle()
+    expect(reads(log)).toBe(1)
+  })
+
+  test('a pane that waits undrawn, or is closed, reads nothing', async ($, on) => {
+    const w = { ...REPO(), unplaced: true }
+    const { log, clock } = world(on, w)
+    await start($)
+    log.lists.length = 0
+    log.runs.length = 0
+    await clock.advance(15_000)
+    await clock.settle()
+    expect(log.lists).toEqual([])
+    expect(log.runs).toEqual([])
+  })
+
+  test('closed: start off leaves no pane, and the ticks do nothing', { options: { start: 'off' } }, async ($, on) => {
+    const { log, clock } = world(on, REPO())
+    await start($)
+    log.lists.length = 0
+    log.runs.length = 0
+    await clock.advance(15_000)
+    await clock.settle()
+    expect(log.lists).toEqual([])
+    expect(log.runs).toEqual([])
+  })
+
+  test('a tick skips while the last tick still reads', async ($, on) => {
+    const w = REPO()
+    const { log, clock } = world(on, w)
+    await start($)
+    w.gitDelays = { status: [12_000] }
+    // 5 s: a read that holds until 17 s; 10 s and 15 s skip; 20 s reads again.
+    await clock.advance(5_000)
+    await clock.settle()
+    expect(reads(log)).toBe(2)
+    await clock.advance(10_000)
+    await clock.settle()
+    expect(reads(log)).toBe(2)
+    await clock.advance(5_000)
+    await clock.settle()
+    expect(reads(log)).toBe(3)
+  })
+
+  test('a change from elsewhere shows on the next tick, without a glow, a chip or a moved cursor', async ($, on) => {
+    let status = STATUS
+    const w = { ...PROJECT(), git: repo(() => status) }
+    const { clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    await pressOpen(ui, 'C:/p/b.md')
+    const active = (await rowsOf(ui)).rows.find(r => r.active)?.id
+    w.dirs[ROOT]!['late.txt'] = 'file'
+    status = Z('## main', ' M b.md', '?? late.txt', '?? src/lib/', '!! node_modules/')
+    await clock.advance(5_000)
+    await clock.settle()
+    expect((await rowOf(ui, 'C:/p/late.txt')).segs.at(-1)).toEqual({ text: ' ?', color: 'success', bold: true })
+    expect(await glowOf(ui)).toEqual({})
+    expect(await chipOf(ui)).toBe(null)
+    expect((await rowsOf(ui)).rows.find(r => r.active)?.id).toBe(active)
+    expect(await ui.find({ type: 'Text', text: 'selected: b.md' })).toBeDefined()
+  })
+
+  test('a tick does not follow the cwd', async ($, on) => {
+    const w = REPO()
+    const { clock } = world(on, w)
+    await start($)
+    const ui = await mount($)
+    w.cwd = 'C:/q'
+    await clock.advance(5_000)
+    await clock.settle()
+    expect((await rowsOf(ui)).rows.map(r => r.id)).toContain('C:/p/b.md')
+    expect(await texts(ui)).toContain('p')
+  })
+})
+
+describe('watching git (spec-05 R2, R4)', () => {
+  test('SessionStart adds the index and HEAD to watchPaths and changes nothing else', async ($, on) => {
+    on('classic.SessionStart', () => ({ additionalContext: ['x'], watchPaths: ['a'] }) as any)
+    const { log } = world(on, { ...PROJECT(), git: withGitDir() })
+    expect(await sessionStart($)).toEqual({ additionalContext: ['x'], watchPaths: ['a', 'C:\\p\\.git\\index', 'C:\\p\\.git\\HEAD'] })
+    expect(log.runs).toEqual([[...FLAGS, 'C:\\p', 'rev-parse', '--absolute-git-dir']])
+  })
+
+  test('outside a repository, or with no git, SessionStart passes the result on as it was', async ($, on) => {
+    let git: World['git'] = () => ({ exitCode: 128 })
+    on('classic.SessionStart', () => ({ additionalContext: ['x'], watchPaths: ['a'] }) as any)
+    world(on, { ...PROJECT(), git: (sub, argv) => git!(sub, argv) })
+    expect(await sessionStart($)).toEqual({ additionalContext: ['x'], watchPaths: ['a'] })
+    git = () => 'reject'
+    expect(await sessionStart($)).toEqual({ additionalContext: ['x'], watchPaths: ['a'] })
+  })
+
+  test('a burst of index changes reads once, 300 ms after the last; other files read nothing', { options: { refresh: 'off' } }, async ($, on) => {
+    on('classic.FileChanged', () => ({}) as any)
+    const { log, clock } = world(on, { ...PROJECT(), git: withGitDir() })
+    await start($)
+    await mount($)
+    expect(reads(log)).toBe(1)
+    for (let i = 0; i < 3; i++) {
+      expect(await fileChanged($, 'C:\\p\\.git\\index')).toEqual({})
+      await clock.advance(100)
+    }
+    await clock.advance(199)
+    await clock.settle()
+    expect(reads(log)).toBe(1)
+    await clock.advance(1)
+    await clock.settle()
+    expect(reads(log)).toBe(2)
+    expect(await fileChanged($, 'C:\\p\\src\\a.ts')).toEqual({})
+    await clock.advance(1_000)
+    await clock.settle()
+    expect(reads(log)).toBe(2)
+  })
+
+  test('with the pane undrawn a git change reads nothing', { options: { refresh: 'off' } }, async ($, on) => {
+    on('classic.FileChanged', () => ({}) as any)
+    const w = { ...PROJECT(), git: withGitDir() }
+    const { log, clock } = world(on, w)
+    await start($)
+    w.unplaced = true
+    log.runs.length = 0
+    await fileChanged($, 'C:\\p\\.git\\HEAD')
+    await clock.advance(1_000)
+    await clock.settle()
+    expect(log.runs).toEqual([])
+  })
+
+  test('a git change reads again even while a tick is reading', { options: { refresh: '10s' } }, async ($, on) => {
+    on('classic.FileChanged', () => ({}) as any)
+    const w = { ...PROJECT(), git: withGitDir() }
+    const { log, clock } = world(on, w)
+    await start($)
+    w.gitDelays = { status: [8_000] }
+    // 10 s: a tick's read holds until 18 s. The change at 10.1 s waits for it, then reads again.
+    await clock.advance(10_000)
+    await clock.settle()
+    await clock.advance(100)
+    await fileChanged($, 'C:\\p\\.git\\index')
+    await clock.advance(8_900)
+    await clock.settle()
+    expect(reads(log)).toBe(3)
   })
 })

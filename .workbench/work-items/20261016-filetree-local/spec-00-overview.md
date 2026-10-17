@@ -43,9 +43,9 @@ Toda fatia deve obedecer a estas regras. Elas são o que diferencia este mod do 
 - R1.1. O mod nunca deve executar um interpretador de comandos. Nenhuma chamada a `$.process.run` ou `$.process.spawn` pode ter como `argv[0]` `sh`, `bash`, `cmd`, `cmd.exe`, `powershell`, `powershell.exe`, `pwsh` ou `pwsh.exe`.
 - R1.2. Os únicos executáveis que o mod pode chamar são os listados em [Executáveis permitidos](#executáveis-permitidos). Uma fatia que precise de outro deve emendar esta spec antes de implementar.
 - R1.3. Todo hook de `tool.call` deve repassar `next(e)` com o mesmo `e`, nunca devolver `deny` e só ler o resultado.
-- R1.4. Todo hook de `prompt.submit`, `prompt.attachment` ou `prompt.compose` deve repassar o evento sem acrescentar ou alterar texto ou contexto que o usuário não veja na tela. O mecanismo visível do contexto de seleção será definido na `spec-07`.
-- R1.5. Quando o mod ler o conteúdo de um arquivo (`$.fs.read`), o caminho real do arquivo, com links resolvidos, deve estar dentro do caminho real da raiz permitida, conforme `Paths.inside`. A raiz permitida será definida na `spec-06`.
-- R1.6. Onde existir a opção "Open with", ela deve vir desligada por padrão e só aceitar programas de uma lista limitada. A forma da lista será definida na `spec-06`.
+- R1.4. Todo hook de `prompt.submit`, `prompt.attachment` ou `prompt.compose` deve repassar o evento sem acrescentar ou alterar texto ou contexto que o usuário não veja na tela. O mecanismo visível do contexto de seleção será definido na `spec-08`.
+- R1.5. Quando o mod ler o conteúdo de um arquivo (`$.fs.read`), o caminho real do arquivo, com links resolvidos, deve estar dentro do caminho real da raiz permitida, conforme `Paths.inside`. A raiz permitida será definida na `spec-07`.
+- R1.6. Onde existir a opção "Open with", ela deve vir desligada por padrão e só aceitar programas de uma lista limitada. A forma da lista será definida na `spec-07`.
 - R1.7. O mod não deve escrever em disco (`$.fs.write`) nem usar `$.store` até que uma spec de fatia defina o caso explicitamente.
 - R1.8. O mod não deve fazer acesso de rede (`fetch`), chamar modelos (`$.model`, `$.agent`) nem expor capacidades ao modelo (`$.tool.register`).
 - R1.9. Toda leitura de variável de ambiente deve usar um nome da lista [Variáveis de ambiente permitidas](#variáveis-de-ambiente-permitidas).
@@ -180,7 +180,7 @@ Ficam como constante em `hooks/os.ts`. Uma fatia que precise de outro executáve
 | Executável | Fatia | Uso |
 |---|---|---|
 | `git.exe` (Windows) / `git` (posix) | spec-03, spec-04 | só subcomandos de leitura: `rev-parse`, `status`, `diff`, `ls-files` (spec-03) e `diff-tree` (spec-04). Toda chamada leva `--no-optional-locks -c core.fsmonitor=false -C <raiz>`, e `diff`/`diff-tree` levam `--no-ext-diff --no-textconv` (spec-03 R1) |
-| `explorer.exe` (Windows) | spec-06 | abrir arquivo ou pasta com o app padrão, com o caminho como único argumento |
+| `explorer.exe` (Windows) | spec-07 | abrir arquivo ou pasta com o app padrão, com o caminho como único argumento |
 
 A `spec-01` não chama nenhum executável.
 
@@ -204,7 +204,7 @@ O contrato de estado fica em `types/index.d.ts`, declarado em `interface PluginS
 | Quem escreve | O Claude escreve e o autor revisa cada fatia | O autor escreve o núcleo | Escolha do autor. A aposta é que a revisão por fatia basta para entender o código. O teste é o autor fazer uma mudança sozinho depois da fatia 1 |
 | Plataforma | Windows primeiro, com `Paths` isolando o SO | Multiplataforma desde já | Só o que o autor consegue verificar é implementado |
 | Shell | Nenhum, nem para abrir arquivos | PowerShell como o original | Elimina injeção por nome de arquivo e a execução de `$PROFILE` |
-| Contexto no prompt | Nada invisível | `e.context` oculto como o original | Regra de segurança do autor. O mecanismo visível fica para a spec-07 |
+| Contexto no prompt | Nada invisível | `e.context` oculto como o original | Regra de segurança do autor. O mecanismo visível fica para a spec-08 |
 | Forma interna de caminho | `/`, drive maiúsculo, comparação sem diferenciar maiúsculas no Windows | Caminho nativo em todo lugar; `/` diferenciando maiúsculas (original) | O original trata `C:\Devs` e `c:\devs` como pastas diferentes |
 | Distribuição | Pasta local via `CLAUDE_CODE_PLUGIN_DIRS`; depois um repositório GitHub sem marketplace | Marketplace próprio | Sem canal de atualização automática |
 | Nome | Plugin `filetree-local`, comando `/filetree` | Plugin `filetree` | Evita colisão com o original e mantém o comando conhecido |
@@ -218,9 +218,10 @@ O contrato de estado fica em `types/index.d.ts`, declarado em `interface PluginS
 | `spec-02` | Atividade do Claude | brilho roxo (leitura por `Read`/`Grep`/`Glob`) e laranja (escrita por `Edit`/`Write`/`NotebookEdit` e varredura de shell), revelação, seguir o Claude, opções `activity` e `follow` | R1.3. Sem parser de comandos: o read-only vem do `isReadOnly` do engine, e as escritas do shell são observadas por `mtimeMs` |
 | `spec-03` | Status do git | cores por status, `+N/-N`, contagens por pasta, linha de branch, upstream e ahead/behind, ignorados, opção `hints` | R1.1, R1.2 (`git.exe`) |
 | `spec-04` | Atividade de git | chips no rodapé a partir do `gitOperation` do engine e da comparação de status (`committed <sha>`, `pushed`, `staged N`, PR…), verde nos arquivos commitados ou preparados, tom da linha da branch e varredura de escrita via git status, que vê pastas fechadas. Sem parser de comandos | R1.2 (`diff-tree`), R1.3 |
-| `spec-05` | Busca e colunas | busca com revelação, tamanhos (`Σ`), idade, opção `column`, glyphs Nerd Font (`glyphs`), dicas de hover nos botões | R1.7 |
-| `spec-06` | Abrir, preview e edição | abrir com app padrão, preview no painel, opções `open` e `edit` | R1.1, R1.2 (`explorer.exe`), R1.5, R1.6 |
-| `spec-07` | Contexto da seleção | seleção como contexto do prompt, `@menções` revelam arquivos | R1.4 |
+| `spec-05` | Atualização automática | releitura periódica com o painel visível (opção `refresh`) e vigilância de `.git/index` e `HEAD` (`watchPaths` no `classic.SessionStart`), para que várias sessões no mesmo diretório vejam as mudanças umas das outras, em silêncio. Não existe no original | R1.2 (`rev-parse --absolute-git-dir`), R1.4 |
+| `spec-06` | Busca e colunas | busca com revelação, tamanhos (`Σ`), idade, opção `column`, glyphs Nerd Font (`glyphs`), dicas de hover nos botões | R1.7 |
+| `spec-07` | Abrir, preview e edição | abrir com app padrão, preview no painel, opções `open` e `edit` | R1.1, R1.2 (`explorer.exe`), R1.5, R1.6 |
+| `spec-08` | Contexto da seleção | seleção como contexto do prompt, `@menções` revelam arquivos | R1.4 |
 
 Funcionalidades do original que **não** serão portadas:
 
@@ -230,7 +231,7 @@ Funcionalidades do original que **não** serão portadas:
 | Editor via tmux (`TMUX_OPEN`) | precisa de tmux, que não existe no Windows nativo |
 | Tema Omarchy | só existe no Linux |
 | Suporte ao herdr | multiplexador fora do escopo do autor |
-| Detecção de Nerd Font via `sh -c` | viola R1.1. A spec-05 decide por opção explícita |
+| Detecção de Nerd Font via `sh -c` | viola R1.1. A spec-06 decide por opção explícita |
 | Paletas hex clara e escura | substituídas por ThemeKeys do engine (decisão da spec-01) |
 
 ## Affected areas
@@ -275,7 +276,7 @@ claude plugin test .
 |---|---|
 | R1.1, R1.2, R1.7, R1.8, R1.9 | ler a saída de `claude plugin validate`: as chamadas listadas não podem incluir `fs.write`, `store.*`, `model.*`, `agent.*` ou `tool.register`; `process.run` e `process.spawn` só aparecem nas fatias que os autorizam; as variáveis de ambiente listadas estão na tabela. Na revisão, conferir os `argv` de cada `process.run` contra a tabela de executáveis |
 | R1.3, R1.4 | testes da fatia correspondente comparam o evento recebido pelo hook de baixo com o original |
-| R1.5, R1.6 | testes da spec-06 |
+| R1.5, R1.6 | testes da spec-07 |
 | R2.1 a R2.6 | `tests/os.test.ts` cobre cada linha da tabela de `Paths`. A revisão confere que nenhum módulo fora de `hooks/os.ts` lê `OS` ou compara caminhos com `===` |
 | R3.2 | manual: com `CLAUDE_CODE_PLUGIN_DIRS` configurado, `/plugin` lista `filetree-local` numa sessão nova |
 | R4 | os três comandos passam |
@@ -292,7 +293,7 @@ Para carregar o mod (passo manual do autor), incluir em `~/.claude/settings.json
 
 ## Out of scope
 
-- Detalhar as fatias 2 a 7. Cada uma ganha a sua spec quando chegar a vez.
+- Detalhar as fatias 2 a 8. Cada uma ganha a sua spec quando chegar a vez.
 - Publicar em marketplace.
 - Suporte efetivo a Linux e macOS. Só a interface `Paths` fica preparada.
 - Persistir estado entre sessões (`$.store`), proibido por R1.7 até uma spec de fatia autorizar.

@@ -5,15 +5,24 @@ import {
   DIFF_ARGS,
   GIT_FLAGS,
   STATUS_ARGS,
+  branchToneOf,
+  chipsOf,
   emptyGit,
   gitArgv,
+  gitCandidates,
   gitOf,
+  gitOperationOf,
+  isGitWatch,
+  isSha,
+  newlyStaged,
   parseBranch,
+  parseNames,
   parsePrefix,
   parseNumstat,
   parseStatus,
   rollCounts,
   rollUp,
+  sameRepo,
   stronger,
 } from '../hooks/git'
 import { executable, paths } from '../hooks/os'
@@ -184,5 +193,121 @@ describe('gitOf (R3.5, R3.6, R5)', () => {
     expect(gitOf(g, P, node('C:/p/dist/app.js'))).toEqual({ ignored: true })
     expect(gitOf(g, P, node('C:/p/dist', 'dir'))).toEqual({ ignored: true })
     expect(gitOf(g, P, node('C:/p/clean.ts'))).toEqual({ ignored: false })
+  })
+})
+
+// ---- spec-04: git activity ----
+
+const state = (over: Partial<GitState>): GitState => ({ ...emptyGit(), root: ROOT, top: ROOT, ...over })
+const branch = (head: string, ahead = 0, behind = 0) => ({ head, upstream: 'origin/main', ahead, behind, detached: false, unborn: false })
+
+describe('staged and sameRepo (spec-04 R2.6, R3.3)', () => {
+  test('column X marks a staged change; untracked, ignored and conflicts are not staged', () => {
+    const r = parseStatus(['## main', 'M  a.ts', ' M b.ts', 'A  c.ts', 'R  d.ts', 'old.ts', 'UU e.ts', 'AA f.ts', '?? g.ts', '!! h/', ''].join('\0'), CTX)
+    expect(r.staged).toEqual(['C:/p/a.ts', 'C:/p/c.ts', 'C:/p/d.ts'])
+  })
+
+  test('the same repository: both reads of the current root, same top', () => {
+    expect(sameRepo(state({}), state({}), ROOT)).toBe(true)
+    expect(sameRepo(state({ top: '' }), state({ top: '' }), ROOT)).toBe(false)
+    expect(sameRepo(state({}), state({ top: 'C:/other' }), ROOT)).toBe(false)
+    expect(sameRepo(state({ root: 'C:/q' }), state({}), ROOT)).toBe(false)
+    expect(sameRepo(emptyGit(), state({}), ROOT)).toBe(false)
+  })
+})
+
+describe('gitCandidates and newlyStaged (spec-04 R2.1, R3.3)', () => {
+  test('fresh: not dirty before, or deleted before; touched: dirty before; deletions are skipped', () => {
+    const before = state({ changes: { 'C:/p/Old.ts': 'mod', 'C:/p/back.ts': 'del', 'C:/p/kept.ts': 'new' } })
+    const after = state({ changes: { 'C:/p/new.ts': 'new', 'C:/p/old.ts': 'mod', 'C:/p/back.ts': 'new', 'C:/p/kept.ts': 'del' } })
+    expect(gitCandidates(before, after, P)).toEqual({ fresh: ['C:/p/new.ts', 'C:/p/back.ts'], touched: ['C:/p/old.ts'] })
+  })
+
+  test('newly staged compares without case', () => {
+    expect(newlyStaged(state({ staged: ['C:/p/A.ts'] }), state({ staged: ['C:/p/a.ts', 'C:/p/b.ts'] }), P)).toEqual(['C:/p/b.ts'])
+  })
+})
+
+describe('sha, names and the engine record (spec-04 R3.1, R3.2, R7.2)', () => {
+  test('isSha takes 7 to 64 hex characters, nothing that could be an option', () => {
+    expect(isSha('a1b2c3d')).toBe(true)
+    expect(isSha('A1B2C3D4E5F6')).toBe(true)
+    expect(isSha('a1b2c3')).toBe(false)
+    expect(isSha('--output=x')).toBe(false)
+    expect(isSha('a1b2c3d HEAD')).toBe(false)
+  })
+
+  test('parseNames maps through the prefix and drops what is outside the root', () => {
+    expect(parseNames(['src/a.ts', 'other/b.ts', ''].join('\0'), { paths: P, root: 'C:/p/src', prefix: 'src/' })).toEqual(['C:/p/src/a.ts'])
+  })
+
+  test('gitOperationOf reads the record defensively', () => {
+    const op = { push: { branch: 'main' } }
+    expect(gitOperationOf({ result: { stdout: '', gitOperation: op }, ref: 1, text: '' } as any)).toBe(op)
+    expect(gitOperationOf({ result: 'text', ref: 1, text: '' } as any)).toBe(undefined)
+    expect(gitOperationOf({ result: { gitOperation: 'x' }, ref: 1, text: '' } as any)).toBe(undefined)
+    expect(gitOperationOf({ deny: 'no' } as any)).toBe(undefined)
+  })
+})
+
+describe('chipsOf and branchToneOf (spec-04 R4.1, R4.7, R6.1)', () => {
+  const b = state({ branch: branch('main', 1) })
+
+  test('the table, in its order', () => {
+    const op = {
+      commit: { sha: 'a1b2c3d4e5', kind: 'committed' as const },
+      branch: { ref: 'feature', action: 'merged' as const },
+      push: { branch: 'main' },
+      pr: { number: 12, action: 'created' as const },
+    }
+    const after = state({ branch: branch('dev') })
+    expect(chipsOf(op, ['C:/p/x.ts'], b, after, true)).toEqual([
+      { icon: '●', text: 'committed', detail: 'a1b2c3d', tone: 'commit' },
+      { icon: '⑃', text: 'merged', detail: 'feature', tone: 'merge' },
+      { icon: '↑', text: 'pushed', detail: 'main', tone: 'sync' },
+      { icon: '⇄', text: 'opened PR #12', detail: '', tone: 'merge' },
+      { icon: '⑂', text: 'switched to', detail: 'dev', tone: 'sync' },
+    ])
+  })
+
+  test('staged only without a commit and in the same repository; amend and cherry-pick', () => {
+    expect(chipsOf(undefined, ['C:/p/a', 'C:/p/b'], b, b, true)).toEqual([{ icon: '±', text: 'staged 2', detail: '', tone: 'commit' }])
+    expect(chipsOf(undefined, ['C:/p/a'], b, b, false)).toEqual([])
+    expect(chipsOf({ commit: { sha: 'abcdef12', kind: 'amended' } }, [], b, b, true)[0]).toEqual({ icon: '●', text: 'amended', detail: 'abcdef1', tone: 'commit' })
+    expect(chipsOf({ commit: { sha: 'abcdef12', kind: 'cherry-picked' } }, [], b, b, true)[0]).toEqual({ icon: '⑃', text: 'cherry-picked', detail: 'abcdef1', tone: 'merge' })
+  })
+
+  test('PR texts', () => {
+    const text = (action: string) => chipsOf({ pr: { number: 3, action } } as any, [], b, b, true)[0]?.text
+    expect(text('merged')).toBe('merged PR #3')
+    expect(text('commented')).toBe('commented on PR #3')
+    expect(text('closed')).toBe('closed PR #3')
+    expect(text('reopened')).toBe('reopened PR #3')
+    expect(text('auto-merge-enabled')).toBe('PR #3 auto merge enabled')
+  })
+
+  test('no switch outside the same repository or without a branch', () => {
+    expect(chipsOf(undefined, [], b, state({ branch: branch('dev') }), false)).toEqual([])
+    expect(chipsOf(undefined, [], state({}), state({ branch: branch('dev') }), true)).toEqual([])
+  })
+
+  test('the tone: the last chip, else sync when ahead or behind moved on the same branch', () => {
+    expect(branchToneOf([{ icon: '●', text: 'committed', detail: '', tone: 'commit' }], b, b, true)).toBe('commit')
+    expect(branchToneOf([], b, state({ branch: branch('main', 0) }), true)).toBe('sync')
+    expect(branchToneOf([], b, state({ branch: branch('main', 1, 1) }), true)).toBe('sync')
+    expect(branchToneOf([], b, b, true)).toBe(null)
+    expect(branchToneOf([], b, state({ branch: branch('main', 0) }), false)).toBe(null)
+  })
+})
+
+describe('isGitWatch (spec-05 R2.4)', () => {
+  test('the index and HEAD of a gitdir, a worktree one too, and nothing else', () => {
+    expect(isGitWatch('C:\\p\\.git\\index')).toBe(true)
+    expect(isGitWatch('C:/p/.git/HEAD')).toBe(true)
+    expect(isGitWatch('C:\\p\\.git\\worktrees\\w\\index')).toBe(true)
+    expect(isGitWatch('C:\\p\\index')).toBe(false)
+    expect(isGitWatch('C:\\p\\.git\\config')).toBe(false)
+    expect(isGitWatch('C:\\p\\.git\\refs\\heads\\main')).toBe(false)
+    expect(isGitWatch('C:\\p\\src\\HEAD')).toBe(false)
   })
 })

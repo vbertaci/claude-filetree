@@ -1,6 +1,6 @@
 {
   "name": "filetree-local",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "description": "IDE-style file tree pane for Claude Code, local build",
   "author": { "name": "w4rl0ck" },
   "types": "./types/index.d.ts",
@@ -15,7 +15,7 @@
     "activity": {
       "type": "string",
       "title": "Claude activity",
-      "description": "Which of Claude's file activity glows in the tree: files read with Read, Grep or Glob in purple, files written with Edit, Write, NotebookEdit or a shell command in orange.",
+      "description": "Which of Claude's file activity glows in the tree: files read with Read, Grep or Glob in purple; files written with Edit, Write, NotebookEdit or a shell command in orange; files Claude committed or staged in green.",
       "default": "reads and writes",
       "options": ["reads and writes", "writes", "reads", "none"]
     },
@@ -25,6 +25,13 @@
       "description": "on: the tree scrolls to what Claude reads or writes and stays there. off: the view stays where you put it; highlights still show.",
       "default": "on",
       "options": ["on", "off"]
+    },
+    "refresh": {
+      "type": "string",
+      "title": "Auto refresh",
+      "description": "How often the tree and git status are read again while the pane shows, so changes made outside this session appear (another session, an editor, a terminal). off: only on focus, ↻ and Claude's own work. Commits and staging in the session's repository show within a second either way.",
+      "default": "5s",
+      "options": ["off", "2s", "5s", "10s"]
     },
     "hints": {
       "type": "string",

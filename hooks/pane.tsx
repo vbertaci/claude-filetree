@@ -1,7 +1,7 @@
 import type { EngineInterface, RenderElement, RenderInput } from 'claude-code'
 
-import type { GitLetter, GitState, Glow, RowSpec, RowsProps, Seg, ThemeKeyName, TreeState } from '../types'
-import { type NodeGit, gitOf } from './git'
+import type { GitChip, GitLetter, GitState, Glow, RowSpec, RowsProps, Seg, ThemeKeyName, Tone, TreeState } from '../types'
+import { BRANCH_ID, type NodeGit, gitOf } from './git'
 import type { Paths } from './os'
 import { type Row, formatDate, visibleRows, windowOf } from './tree'
 
@@ -54,6 +54,14 @@ const LETTER_COLOR: Record<GitLetter, ThemeKeyName> = {
   C: 'suggestion',
   D: 'error',
   U: 'error',
+}
+
+const TONE_COLOR: Record<Tone, ThemeKeyName> = {
+  read: 'autoAccept',
+  write: 'claude',
+  commit: 'success',
+  sync: 'suggestion',
+  merge: 'merged',
 }
 
 /** A row's git suffixes: `loc` takes the date's place, `cell` closes the row (spec-03 R5.4, R5.5). */
@@ -131,7 +139,7 @@ function rowSpec(row: Row, t: TreeState, total: number, bar: number, showDate: b
   const lit = glow?.lit[node.id]
   if (lit) {
     // A lit name is a segment of its own, so the Client can run the band over it alone (spec-02 R5.3).
-    segs.push({ text: name, color: lit.tone === 'read' ? 'autoAccept' : 'claude', glow: lit.faint ? 'faint' : 'bright' })
+    segs.push({ text: name, color: TONE_COLOR[lit.tone], glow: lit.faint ? 'faint' : 'bright' })
     if (node.error) segs.push({ text: ` (unreadable)${pad}`, color: 'error' })
     else if (pad !== '') segs.push({ text: pad, color })
   } else if (node.error) segs.push({ text: name, ...nameStyle }, { text: ` (unreadable)${pad}`, color: 'error' })
@@ -156,6 +164,7 @@ export function layoutPane(
   glow: GlowView,
   git: GitView,
   paths: Paths,
+  chip: GitChip | null,
 ): Layout {
   const rows = visibleRows(t)
   const total = Math.max(1, view.bodyColumns)
@@ -199,7 +208,8 @@ export function layoutPane(
     }
   }
 
-  const fixedRows = 2 + (extra !== null ? 1 : 0) + (t.selected !== '' ? 1 : 0)
+  const footer = t.selected !== '' || chip !== null
+  const fixedRows = 2 + (extra !== null ? 1 : 0) + (footer ? 1 : 0)
   const room = Math.max(5, view.bodyRows - fixedRows)
   // While following, the automatic window centres on what Claude touched, if it is in view (spec-02 R7.1).
   const focusIndex = glow?.focus ? rows.findIndex(r => r.id === glow.focus) : -1
@@ -231,6 +241,8 @@ export function renderPane(
   t: TreeState,
   layout: Layout,
   git: GitView,
+  glow: GlowView,
+  chip: GitChip | null,
   actions: PaneActions,
 ): RenderElement {
   const { Box, Text, Button, Client } = $.ui.resolve(e)
@@ -243,11 +255,15 @@ export function renderPane(
     const rootKey = paths.key(t.root)
     const [added, removed] = git.state.diff[rootKey] ?? [0, 0]
     const counts = countSegs(git.state.counts[rootKey])
+    // While the branch row glows, the glyph and the name take the action's tone (spec-04 R6.4).
+    const lit = glow?.lit[BRANCH_ID]
     return (
       <Box flexDirection="row">
         <Box flexDirection="row" flexShrink={0}>
-          <Text color="suggestion">⑂ </Text>
-          <Text color="text" weight="bold">
+          <Text color={lit ? TONE_COLOR[lit.tone] : 'suggestion'} {...(lit ? { weight: 'bold' as const } : {})}>
+            ⑂{' '}
+          </Text>
+          <Text color={lit ? TONE_COLOR[lit.tone] : 'text'} weight="bold">
             {b.head}
           </Text>
           {b.ahead > 0 && <Text color="suggestion">{` ↑${b.ahead}`}</Text>}
@@ -308,10 +324,22 @@ export function renderPane(
       ) : (
         <Client key="rows" module="./rows.tsx" props={layout.props} />
       )}
-      {t.selected !== '' && (
-        <Text color="subtle" wrap="truncate-start">
-          selected: {paths.native(paths.relative(t.root, t.selected))}
-        </Text>
+      {(t.selected !== '' || chip !== null) && (
+        <Box flexDirection="row">
+          <Box flexGrow={1} flexShrink={1} overflow="hidden">
+            {t.selected !== '' && (
+              <Text color="subtle" wrap="truncate-start">
+                selected: {paths.native(paths.relative(t.root, t.selected))}
+              </Text>
+            )}
+          </Box>
+          {chip !== null && (
+            <Box flexDirection="row" flexShrink={0} marginLeft={2}>
+              <Text color={TONE_COLOR[chip.tone]}>{`${chip.icon} ${chip.text}`}</Text>
+              {chip.detail !== '' && <Text color="subtle">{` ${chip.detail}`}</Text>}
+            </Box>
+          )}
+        </Box>
       )}
     </Box>
   )

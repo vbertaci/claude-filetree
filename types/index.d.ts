@@ -43,14 +43,14 @@ export type TreeState = {
  */
 export type ExpansionMemory = Record<string, string[]>
 
-export type Tone = 'read' | 'write'
+export type Tone = 'read' | 'write' | 'commit' | 'sync' | 'merge'
 
 export type Glow = { tone: Tone; faint?: true }
 
 export type ActivityState = {
   /** tree.root when the batch lit; under another root, lit is ignored. */
   root: string
-  /** Node id → glow. */
+  /** Node id → glow; '#branch' is the branch row. */
   lit: Record<string, Glow>
   /** Last bright id of the latest batch; '' without a glow. */
   focus: string
@@ -95,11 +95,26 @@ export type GitState = {
   ignored: string[]
   /** Ids (Paths.norm) of untracked folders. */
   untracked: string[]
+  /** Ids (as git spells them) with a change staged in the index (column X of the porcelain). */
+  staged: string[]
   branch: Branch | null
 }
 
+export type GitChip = {
+  /** tree.root when the chip was set; under another root it is not drawn. */
+  root: string
+  /** '●' '⑃' '↑' '⇄' '±' '⑂' */
+  icon: string
+  text: string
+  /** sha7, a branch name or a ref; '' without one. */
+  detail: string
+  tone: Tone
+  /** $.clock.now() when it was set. */
+  at: number
+}
+
 /** Shapes shared between pane.tsx and the rows.tsx Client. */
-export type ThemeKeyName = 'text' | 'subtle' | 'suggestion' | 'error' | 'claude' | 'autoAccept' | 'success' | 'warning'
+export type ThemeKeyName = 'text' | 'subtle' | 'suggestion' | 'error' | 'claude' | 'autoAccept' | 'success' | 'warning' | 'merged'
 
 export type Seg = { text: string; color?: ThemeKeyName; bold?: true; dim?: true; strike?: true; glow?: 'bright' | 'faint' }
 
@@ -128,6 +143,7 @@ declare module 'claude-code' {
       memory: ExpansionMemory
       activity: ActivityState
       git: GitState
+      chip: GitChip | null
     }
   }
 }

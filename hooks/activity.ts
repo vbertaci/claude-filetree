@@ -1,6 +1,7 @@
 import type { PluginOptions, ToolCallInput, ToolCallResult } from 'claude-code'
 
 import type { ActivityState, FileNode, Glow, Tone, TreeState } from '../types'
+import { BRANCH_ID } from './git'
 import type { Paths } from './os'
 import { visibleRows } from './tree'
 
@@ -25,6 +26,14 @@ export function emptyActivity(): ActivityState {
 export function settingsOf(options: PluginOptions): Settings {
   const activity = typeof options.activity === 'string' && ACTIVITY.includes(options.activity) ? options.activity : 'reads and writes'
   return { reads: activity.includes('reads'), writes: activity.includes('writes'), follow: options.follow !== 'off' }
+}
+
+const REFRESH: Record<string, number | null> = { off: null, '2s': 2_000, '5s': 5_000, '10s': 10_000 }
+
+/** The period of the `refresh` option; an unknown value is the default (spec-05 R1.1). */
+export function refreshMsOf(options: PluginOptions): number | null {
+  const v = typeof options.refresh === 'string' && options.refresh in REFRESH ? options.refresh : '5s'
+  return REFRESH[v] ?? null
 }
 
 /** A field of the tool's record; the record is the tool's, so nothing about it is assumed. */
@@ -111,6 +120,14 @@ export function light(a: ActivityState, t: TreeState, paths: Paths, ids: readonl
   }
   if (focus === '') return { activity: a, expanded: t.expanded }
   return { activity: { root: t.root, lit, focus, until: now + FLASH_MS }, expanded: [...open] }
+}
+
+/** Joins the branch row's glow to a live one, as `light` does with nodes (spec-04 R6.2). */
+export function lightBranch(a: ActivityState, root: string, tone: Tone, now: number): ActivityState {
+  const live = isLive(a, root, now)
+  const lit: Record<string, Glow> = live ? { ...a.lit } : {}
+  lit[BRANCH_ID] = { tone }
+  return { root, lit, focus: live ? a.focus : '', until: now + FLASH_MS }
 }
 
 /** The index the top row of `before`'s window has in `after`; `before.scroll` when it is gone (R7.3). */

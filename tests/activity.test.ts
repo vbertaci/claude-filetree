@@ -10,6 +10,8 @@ import {
   isLive,
   keepTop,
   light,
+  lightBranch,
+  refreshMsOf,
   scanDirs,
   settingsOf,
   touchOf,
@@ -41,6 +43,16 @@ describe('settingsOf (R3.1, R3.4)', () => {
     expect(settingsOf({ activity: 'reads' })).toEqual({ reads: true, writes: false, follow: true })
     expect(settingsOf({ activity: 'none' })).toEqual({ reads: false, writes: false, follow: true })
     expect(settingsOf({ activity: 'nonsense', follow: 'maybe' })).toEqual({ reads: true, writes: true, follow: true })
+  })
+})
+
+describe('refreshMsOf (spec-05 R1.1)', () => {
+  test('each value, and an unknown one as the default', () => {
+    expect(refreshMsOf({})).toBe(5_000)
+    expect(refreshMsOf({ refresh: 'off' })).toBe(null)
+    expect(refreshMsOf({ refresh: '2s' })).toBe(2_000)
+    expect(refreshMsOf({ refresh: '10s' })).toBe(10_000)
+    expect(refreshMsOf({ refresh: '1m' })).toBe(5_000)
   })
 })
 
@@ -142,6 +154,19 @@ describe('light (R4.4, R4.5, R5.1, R5.2)', () => {
     expect(isLive(old, ROOT, 899)).toBe(true)
     expect(isLive(old, ROOT, 900)).toBe(false)
     expect(isLive(old, 'C:/q', 899)).toBe(false)
+  })
+})
+
+describe('lightBranch (spec-04 R6.2, R6.3)', () => {
+  test('joins a live glow, keeps its focus and moves the deadline; alone, no focus', () => {
+    const live = light(emptyActivity(), sample(), P, ['C:/p/c.md'], 'write', 1000).activity
+    expect(lightBranch(live, ROOT, 'sync', 2000)).toEqual({
+      root: ROOT,
+      lit: { 'C:/p/c.md': { tone: 'write' }, '#branch': { tone: 'sync' } },
+      focus: 'C:/p/c.md',
+      until: 2000 + FLASH_MS,
+    })
+    expect(lightBranch(live, ROOT, 'commit', 1000 + FLASH_MS)).toEqual({ root: ROOT, lit: { '#branch': { tone: 'commit' } }, focus: '', until: 1000 + 2 * FLASH_MS })
   })
 })
 

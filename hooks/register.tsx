@@ -13,7 +13,7 @@ import type {
   ToolCallResult,
 } from 'claude-code'
 
-import type { ActivityState, ExpansionMemory, GitState, RowsMessage, Tone } from '../types'
+import type { ActivityState, ExpansionMemory, GitChip, GitState, RowsMessage, Tone } from '../types'
 import {
   FLASH_MS,
   SCAN_LIT_LIMIT,
@@ -24,22 +24,38 @@ import {
   isLive,
   keepTop,
   light,
+  lightBranch,
+  refreshMsOf,
   scanDirs,
   settingsOf,
   touchOf,
 } from './activity'
 import {
+  CHIP_MS,
+  type ChipSpec,
   DIFF_ARGS,
+  GREEN_LIMIT,
   type GitSub,
   STATUS_ARGS,
+  STAT_BATCH,
+  STAT_LIMIT,
   UNTRACKED_DIR_LIMIT,
+  branchToneOf,
+  chipsOf,
   emptyGit,
   gitArgv,
+  gitCandidates,
+  gitOperationOf,
+  isGitWatch,
+  isSha,
+  newlyStaged,
+  parseNames,
   parseNumstat,
   parsePrefix,
   parseStatus,
   rollCounts,
   rollUp,
+  sameRepo,
 } from './git'
 import { type Paths, detectHome, detectPlatform, executable, paths as makePaths } from './os'
 import { layoutPane, renderPane, rootLabel } from './pane'
@@ -69,9 +85,10 @@ const treeAtom = atom({ plugin: 'filetree-local', key: 'tree' }, emptyTree('', t
 const memoryAtom = atom({ plugin: 'filetree-local', key: 'memory' }, {} as ExpansionMemory)
 const activityAtom = atom({ plugin: 'filetree-local', key: 'activity' }, emptyActivity())
 const gitAtom = atom({ plugin: 'filetree-local', key: 'git' }, emptyGit())
+const chipAtom = atom({ plugin: 'filetree-local', key: 'chip' }, null as GitChip | null)
 
 /** What a shell call's scan compares against, taken before the call runs (R6.1). */
-type Snapshot = { since: number; generation: number; dirs: string[]; names: Map<string, Set<string>> }
+type Snapshot = { since: number; generation: number; dirs: string[]; names: Map<string, Set<string>>; git: GitState }
 
 // Module variables: lost on a hot reload, none of them needed for correctness.
 let paths: Paths = makePaths('posix')
@@ -92,6 +109,13 @@ let hints = true
 /** The git read running, and the one queued behind it (spec-03 R4.2). */
 let gitRun: Promise<void> | null = null
 let gitNext: Promise<void> | null = null
+let chipTimer: Timer | null = null
+/** The period of the auto refresh, null when off (spec-05 R1). */
+let refreshMs: number | null = 5_000
+let ticker: Timer | null = null
+/** True while a tick's read runs, so the next tick skips (spec-05 R1.5). */
+let ticking = false
+let gitWatch: Timer | null = null
 
 // A refused call reads "<plugin>: $.fs.list: EACCES: ..."; the person needs only the reason.
 const message = (err: unknown): string => (err instanceof Error ? err.message : String(err)).replace(/^[\w-]+: \$\.[\w.]+: /, '')
@@ -151,6 +175,27 @@ async function refresh($: EngineInterface) {
   await refreshGit($)
 }
 
+/** Whether the pane draws now (spec-05 R1.4, R2.5). */
+async function paneVisible($: EngineInterface): Promise<boolean> {
+  return (await $.ui.panes()).some(p => p.id === PANE && p.isPlaced)
+}
+
+/** One tick: nothing while the pane waits undrawn or the last tick's read still runs (spec-05 R1.4–R1.6). */
+async function tick($: EngineInterface) {
+  if (ticking || !(await paneVisible($))) return
+  ticking = true
+  try {
+    await refresh($)
+  } finally {
+    ticking = false
+  }
+}
+
+/** A git change the engine saw: the same read, not held back by a running tick (spec-05 R2.5). */
+async function gitChanged($: EngineInterface) {
+  if (await paneVisible($)) await refresh($)
+}
+
 /** The only caller of $.process.run in the mod: git, by argv, with the fixed flags (spec-03 R1). */
 async function runGit($: EngineInterface, root: string, sub: GitSub, args: readonly string[], timeoutMs: number) {
   return $.process.run(gitArgv(executable('git', paths.platform), paths, root, sub, args), { timeoutMs })
@@ -207,10 +252,18 @@ async function readGit($: EngineInterface) {
     changes,
     ignored: parsed.ignored,
     untracked: parsed.untracked,
+    staged: parsed.staged,
     branch: parsed.branch,
     diff: rollUp(diff, ctx),
     counts: rollCounts(changes, ctx),
   })
+}
+
+/** The gitdir of `cwd`, or '' outside a repository or when git cannot run (spec-05 R2.1, R2.3). */
+async function gitDirOf($: EngineInterface, cwd: string): Promise<string> {
+  const run = await runGit($, cwd, 'rev-parse', ['--absolute-git-dir'], 5_000).catch(() => null)
+  const dir = run?.exitCode === 0 ? run.stdout.trim() : ''
+  return dir === '' ? '' : paths.norm(dir)
 }
 
 /** One read at a time; a request during a read waits for the next one, which starts after it (R4.2). */
@@ -283,21 +336,83 @@ async function snapshot($: EngineInterface): Promise<Snapshot> {
   const t = await read($, treeAtom)
   const dirs = scanDirs(t)
   const names = new Map(dirs.map(dir => [paths.key(dir), new Set(t.nodes.filter(n => n.parent === dir).map(n => n.name))]))
-  return { since, generation: t.generation, dirs, names }
+  return { since, generation: t.generation, dirs, names, git: await read($, gitAtom) }
 }
 
-/** Relists the folders the snapshot saw and lights what changed in them (R6.3, R6.4). */
-async function scan($: EngineInterface, before: Snapshot) {
+/** Relists the folders the snapshot saw and returns what changed in them, unlit (spec-02 R6.3, R6.4). */
+async function scanFolders($: EngineInterface, before: Snapshot): Promise<string[]> {
   for (const dir of before.dirs) await listDir($, dir)
-  if (!settings.writes) return
   const t = await read($, treeAtom)
-  if (t.generation !== before.generation) return
+  if (t.generation !== before.generation) return []
   const ids: string[] = []
   for (const dir of before.dirs) {
     ids.push(...changedIn(before.names.get(paths.key(dir)), t.nodes.filter(n => n.parent === dir), before.since))
     if (ids.length >= SCAN_LIT_LIMIT) break
   }
-  if (ids.length > 0) await flash($, ids.slice(0, SCAN_LIT_LIMIT), 'write', before.generation)
+  return ids.slice(0, SCAN_LIT_LIMIT)
+}
+
+/** The ids whose file changed since `since`, in their order; a failed stat is no hit (spec-04 R2.2). */
+async function newerThan($: EngineInterface, ids: readonly string[], since: number): Promise<string[]> {
+  const out: string[] = []
+  for (let i = 0; i < ids.length; i += STAT_BATCH) {
+    const batch = ids.slice(i, i + STAT_BATCH)
+    const hits = await Promise.all(batch.map(id => $.fs.stat(paths.native(id)).then(s => s.mtimeMs >= since, () => false)))
+    out.push(...batch.filter((_, j) => hits[j]))
+  }
+  return out
+}
+
+/** The files of the commit the command made, by its sha; nothing unless the sha is hex (spec-04 R3.1, R3.2, R3.5). */
+async function committedIds($: EngineInterface, sha: string, g: GitState): Promise<string[]> {
+  if (!isSha(sha) || g.top === '') return []
+  const args = ['--root', '--no-commit-id', '--name-only', '-r', '-z', '--no-ext-diff', '--no-textconv', sha]
+  const run = await runGit($, g.root, 'diff-tree', args, 5_000).catch(() => null)
+  return run?.exitCode === 0 ? parseNames(run.stdout, { paths, root: g.root, prefix: g.prefix }) : []
+}
+
+/**
+ * What a shell command did: the folder scan of spec-02 plus the dirty files git reports, the files
+ * it committed or staged in green, the chip and the branch row (spec-04).
+ */
+async function shellActivity($: EngineInterface, before: Snapshot, result: ToolCallResult) {
+  const gen = before.generation
+  const alive = async () => (await read($, treeAtom)).generation === gen
+
+  const folderIds = await scanFolders($, before)
+  // The read starts after the command, so `after` is what it left (R1.3).
+  await refreshGit($)
+  if (!(await alive())) return
+  const { root } = await read($, treeAtom)
+  const after = await read($, gitAtom)
+  const repo = sameRepo(before.git, after, root)
+
+  let gitIds: string[] = []
+  if (repo) {
+    const { fresh, touched } = gitCandidates(before.git, after, paths)
+    gitIds = [...fresh, ...(await newerThan($, touched.slice(0, STAT_LIMIT), before.since))]
+  }
+  const seen = new Set(folderIds.map(id => paths.key(id)))
+  const ids = [...folderIds, ...gitIds.filter(id => !seen.has(paths.key(id)))].slice(0, SCAN_LIT_LIMIT)
+  if (settings.writes && ids.length > 0) {
+    const listed = new Set<string>()
+    for (const id of gitIds) if (ids.includes(id) && !(await uncover($, id, gen, true, listed))) return
+    await flash($, ids, 'write', gen)
+  }
+
+  // Green after orange, so a file in both ends green (R3.4).
+  const op = gitOperationOf(result)
+  const staged = repo && !op?.commit ? newlyStaged(before.git, after, paths) : []
+  if (settings.writes) {
+    const green = op?.commit ? await committedIds($, op.commit.sha, after) : staged
+    if (green.length > 0 && (await alive())) await reveal($, green.slice(0, GREEN_LIMIT), 'commit')
+  }
+
+  const chips = chipsOf(op, staged, before.git, after, repo)
+  const last = chips.at(-1)
+  if (last && (await alive())) await setChip($, last, root)
+  const tone = branchToneOf(chips, before.git, after, repo)
+  if (settings.writes && tone !== null && after.branch !== null && (await alive())) await flashBranch($, tone)
 }
 
 async function flash($: EngineInterface, ids: readonly string[], tone: Tone, generation: number) {
@@ -318,9 +433,39 @@ async function flash($: EngineInterface, ids: readonly string[], tone: Tone, gen
   if (lit === null) return
   const next: ActivityState = lit
   await update($, activityAtom, () => next)
+  endGlowIn($, FLASH_MS)
+}
+
+/** Lights the branch row in the action's tone; the tree, its focus and its scroll stay (spec-04 R6.2, R6.3). */
+async function flashBranch($: EngineInterface, tone: Tone) {
+  const { root } = await read($, treeAtom)
+  const now = await $.clock.now()
+  const lit = lightBranch(await read($, activityAtom), root, tone, now)
+  await update($, activityAtom, () => lit)
+  endGlowIn($, FLASH_MS)
+}
+
+/** One timer for every glow: only the latest one clears (spec-02 G2). */
+function endGlowIn($: EngineInterface, ms: number) {
   glowTimer?.cancel()
   const seq = ++glowSeq
-  glowTimer = $.clock.after(FLASH_MS, () => void endGlow($, seq).catch(() => undefined))
+  glowTimer = $.clock.after(ms, () => void endGlow($, seq).catch(() => undefined))
+}
+
+async function setChip($: EngineInterface, spec: ChipSpec, root: string) {
+  const at = await $.clock.now()
+  await update($, chipAtom, () => ({ ...spec, root, at }))
+  endChipIn($, at, CHIP_MS)
+}
+
+function endChipIn($: EngineInterface, at: number, ms: number) {
+  chipTimer?.cancel()
+  chipTimer = $.clock.after(ms, () => void endChip($, at).catch(() => undefined))
+}
+
+/** Clears the chip, unless a newer one took its place (spec-04 R4.5). */
+async function endChip($: EngineInterface, at: number) {
+  await update($, chipAtom, c => (c?.at === at ? null : c))
 }
 
 async function endGlow($: EngineInterface, seq: number) {
@@ -344,8 +489,7 @@ async function observe($: EngineInterface, e: ToolCallInput, result: ToolCallRes
     else await relistParents($, touch.ids)
     void refreshGit($).catch(() => undefined)
   } else if (before) {
-    await scan($, before)
-    void refreshGit($).catch(() => undefined)
+    await shellActivity($, before, result)
   }
 }
 
@@ -477,6 +621,7 @@ async function runFiletree($: EngineInterface, e: CommandRunInput): Promise<Comm
 export const register: Register = (on, options) => {
   settings = settingsOf(options)
   hints = options.hints !== 'off'
+  refreshMs = refreshMsOf(options)
 
   on('session.start', async ($, e, next) => {
     paths = makePaths(await detectPlatform($))
@@ -501,11 +646,24 @@ export const register: Register = (on, options) => {
     const { until } = await read($, activityAtom)
     if (until !== 0) {
       const now = await $.clock.now()
-      glowTimer?.cancel()
-      const seq = ++glowSeq
-      if (until > now) glowTimer = $.clock.after(until - now, () => void endGlow($, seq).catch(() => undefined))
-      else await endGlow($, seq)
+      if (until > now) endGlowIn($, until - now)
+      else {
+        glowTimer?.cancel()
+        await endGlow($, ++glowSeq)
+      }
     }
+    // Likewise the chip (spec-04 R4.5).
+    const chip = await read($, chipAtom)
+    if (chip !== null) {
+      const left = chip.at + CHIP_MS - (await $.clock.now())
+      if (left > 0) endChipIn($, chip.at, left)
+      else await endChip($, chip.at)
+    }
+    // One interval per module; a second start replaces it (spec-05 R1.2, R1.3).
+    ticker?.cancel()
+    ticker = null
+    const ms = refreshMs
+    if (ms !== null) ticker = $.clock.every(ms, () => void tick($).catch(() => undefined))
     return next(e)
   })
 
@@ -537,15 +695,18 @@ export const register: Register = (on, options) => {
     }
     const t = await read($, treeAtom)
     const activity = await read($, activityAtom)
-    const glow = isLive(activity, t.root, await $.clock.now()) ? { lit: activity.lit, focus: settings.follow ? activity.focus : null } : null
+    const now = await $.clock.now()
+    const glow = isLive(activity, t.root, now) ? { lit: activity.lit, focus: settings.follow ? activity.focus : null } : null
     const g = await read($, gitAtom)
     const git = g.root === t.root ? { state: g, hints } : null
-    const layout = layoutPane(t, { surface: e.surface, bodyColumns: e.props.bodyColumns, bodyRows: e.props.scroll.bodyRows }, glow, git, paths)
+    const c = await read($, chipAtom)
+    const chip = c !== null && c.root === t.root && now - c.at < CHIP_MS ? c : null
+    const layout = layoutPane(t, { surface: e.surface, bodyColumns: e.props.bodyColumns, bodyRows: e.props.scroll.bodyRows }, glow, git, paths, chip)
     view = { from: layout.from, max: layout.max }
     // The focus goes back to `open` after a nav button; a ring that cannot move is no failure.
     const nav = (k: KeyInput['key']) =>
       key($, { key: k }, e.surface).then(() => $.ui.focus({ requestId: PANE, key: 'nav-o' }).catch(() => undefined))
-    return renderPane($, e, paths, t, layout, git, {
+    return renderPane($, e, paths, t, layout, git, glow, chip, {
       up: async () => {
         const up = paths.parent(t.root)
         if (up !== null) await reroot($, up, { follow: false, open: false })
@@ -581,6 +742,31 @@ export const register: Register = (on, options) => {
   on('ui.focus', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     await sync($)
     return next(e)
+  })
+
+  // Asks the engine to watch the session's index and HEAD; nothing else in the result changes (spec-05 R2.1–R2.3, R4.1).
+  on('classic.SessionStart', async ($, e, next) => {
+    const result = await next(e)
+    // This hook may run before session.start has set the platform; a failure here only means no watch.
+    const dir = await detectPlatform($)
+      .then(platform => {
+        if (paths.platform !== platform) paths = makePaths(platform)
+        return gitDirOf($, paths.norm(e.cwd))
+      })
+      .catch(() => '')
+    if (dir === '') return result
+    const watch = [paths.native(paths.join(dir, 'index')), paths.native(paths.join(dir, 'HEAD'))]
+    return { ...result, watchPaths: [...(result.watchPaths ?? []), ...watch] }
+  })
+
+  // A git change reads again once the index has been quiet for 300 ms (spec-05 R2.4, R2.6).
+  on('classic.FileChanged', async ($, e, next) => {
+    const result = await next(e)
+    if (isGitWatch(e.file_path)) {
+      gitWatch?.cancel()
+      gitWatch = $.clock.after(300, () => void gitChanged($).catch(() => undefined))
+    }
+    return result
   })
 
   on('classic.CwdChanged', async ($, e, next) => {
