@@ -1,6 +1,6 @@
 import type { EngineInterface, RenderElement, RenderInput } from 'claude-code'
 
-import type { RowSpec, RowsProps, Seg, TreeState } from '../types'
+import type { Glow, RowSpec, RowsProps, Seg, TreeState } from '../types'
 import type { Paths } from './os'
 import { type Row, formatDate, visibleRows, windowOf } from './tree'
 
@@ -12,6 +12,9 @@ export const DESKTOP_ROW_CAP = 1500
 export const DESKTOP_CHAR_BUDGET = 45_000
 const DATE_WIDTH = 16
 const MIN_NAME = 12
+
+/** What glows while a glow is live; `focus` is null when follow is off. */
+export type GlowView = { lit: Record<string, Glow>; focus: string | null } | null
 
 export type Layout = {
   rows: Row[]
@@ -43,7 +46,7 @@ function fixedWidth(row: Row, bar: number): number {
   return row.depth * 2 + 2 + 2 + bar + suffix.length
 }
 
-function rowSpec(row: Row, t: TreeState, width: number, bar: number, showDate: boolean): RowSpec {
+function rowSpec(row: Row, t: TreeState, width: number, bar: number, showDate: boolean, glow: GlowView): RowSpec {
   const { node } = row
   const fixed = fixedWidth(row, bar)
   const dated = showDate && node.kind === 'file'
@@ -64,7 +67,13 @@ function rowSpec(row: Row, t: TreeState, width: number, bar: number, showDate: b
       ? [{ text: indent + caret, color: 'subtle' }, { text: glyph, color: 'suggestion' }]
       : [{ text: indent + caret + glyph, color: 'subtle' }]
   const nameStyle = { color: node.hidden ? ('subtle' as const) : ('text' as const), ...(isSelected ? { bold: true as const } : {}) }
-  if (node.error) segs.push({ text: name, ...nameStyle }, { text: ` (unreadable)${pad}`, color: 'error' })
+  const lit = glow?.lit[node.id]
+  if (lit) {
+    // A lit name is a segment of its own, so the Client can run the band over it alone (R5.3).
+    segs.push({ text: name, color: lit.tone === 'read' ? 'autoAccept' : 'claude', glow: lit.faint ? 'faint' : 'bright' })
+    if (node.error) segs.push({ text: ` (unreadable)${pad}`, color: 'error' })
+    else if (pad !== '') segs.push({ text: pad, color: nameStyle.color })
+  } else if (node.error) segs.push({ text: name, ...nameStyle }, { text: ` (unreadable)${pad}`, color: 'error' })
   else segs.push({ text: name + pad, ...nameStyle })
   if (dated) segs.push({ text: date, color: 'subtle' })
   return { id: node.id, segs, active: node.id === t.cursor }
@@ -74,6 +83,7 @@ function rowSpec(row: Row, t: TreeState, width: number, bar: number, showDate: b
 export function layoutPane(
   t: TreeState,
   view: { surface: string; bodyColumns: number; bodyRows: number },
+  glow: GlowView,
 ): Layout {
   const rows = visibleRows(t)
   const width = Math.max(1, view.bodyColumns)
@@ -84,7 +94,7 @@ export function layoutPane(
     const specs: RowSpec[] = []
     let chars = 0
     for (const r of candidates) {
-      const spec = rowSpec(r, t, width, 0, showDate)
+      const spec = rowSpec(r, t, width, 0, showDate, glow)
       chars += JSON.stringify(spec).length + 1
       if (chars > DESKTOP_CHAR_BUDGET) break
       specs.push(spec)
@@ -105,7 +115,9 @@ export function layoutPane(
 
   const fixedRows = 2 + (t.selected !== '' ? 1 : 0)
   const room = Math.max(5, view.bodyRows - fixedRows)
-  const cursorIndex = rows.findIndex(r => r.id === t.cursor)
+  // While following, the automatic window centres on what Claude touched, if it is in view (R7.1).
+  const focusIndex = glow?.focus ? rows.findIndex(r => r.id === glow.focus) : -1
+  const cursorIndex = focusIndex >= 0 ? focusIndex : rows.findIndex(r => r.id === t.cursor)
   const { from, max } = windowOf(rows.length, cursorIndex, room, t.scroll)
   const shown = rows.slice(from, from + room)
   const bar = rows.length > room ? 1 : 0
@@ -117,7 +129,7 @@ export function layoutPane(
     max,
     room,
     props: {
-      rows: shown.map(r => rowSpec(r, t, width, bar, showDate)),
+      rows: shown.map(r => rowSpec(r, t, width, bar, showDate, glow)),
       bar: bar ? { thumbFrom: max === 0 ? 0 : Math.round((from / max) * (room - thumbSize)), thumbSize } : null,
       empty: rows.length === 0 ? 'empty' : null,
       more: 0,

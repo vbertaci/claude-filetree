@@ -1,6 +1,6 @@
 {
   "name": "filetree-local",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "IDE-style file tree pane for Claude Code, local build",
   "author": { "name": "w4rl0ck" },
   "types": "./types/index.d.ts",
@@ -9,6 +9,20 @@
       "type": "string",
       "title": "Open at start",
       "description": "on: the pane opens when a session starts. off: it stays closed until you run /filetree.",
+      "default": "on",
+      "options": ["on", "off"]
+    },
+    "activity": {
+      "type": "string",
+      "title": "Claude activity",
+      "description": "Which of Claude's file activity glows in the tree: files read with Read, Grep or Glob in purple, files written with Edit, Write, NotebookEdit or a shell command in orange.",
+      "default": "reads and writes",
+      "options": ["reads and writes", "writes", "reads", "none"]
+    },
+    "follow": {
+      "type": "string",
+      "title": "Follow Claude",
+      "description": "on: the tree scrolls to what Claude reads or writes and stays there. off: the view stays where you put it; highlights still show.",
       "default": "on",
       "options": ["on", "off"]
     }

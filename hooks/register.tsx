@@ -1,7 +1,32 @@
 import { atom, read, update } from 'claude-code'
-import type { CommandRunInput, CommandRunResult, EngineInterface, FsEntry, FsStat, Register, RenderSurface } from 'claude-code'
+import type {
+  CommandRunInput,
+  CommandRunResult,
+  EngineInterface,
+  FsEntry,
+  FsStat,
+  Register,
+  RenderSurface,
+  Timer,
+  ToolCallInput,
+  ToolCallResult,
+} from 'claude-code'
 
-import type { ExpansionMemory, RowsMessage } from '../types'
+import type { ActivityState, ExpansionMemory, RowsMessage, Tone } from '../types'
+import {
+  FLASH_MS,
+  SCAN_LIT_LIMIT,
+  type Settings,
+  ancestorsOf,
+  changedIn,
+  emptyActivity,
+  isLive,
+  keepTop,
+  light,
+  scanDirs,
+  settingsOf,
+  touchOf,
+} from './activity'
 import { type Paths, detectHome, detectPlatform, paths as makePaths } from './os'
 import { layoutPane, renderPane, rootLabel } from './pane'
 import {
@@ -28,6 +53,10 @@ const TOO_NARROW = 'filetree needs a terminal at least 110 columns wide. Widen i
 
 const treeAtom = atom({ plugin: 'filetree-local', key: 'tree' }, emptyTree('', true))
 const memoryAtom = atom({ plugin: 'filetree-local', key: 'memory' }, {} as ExpansionMemory)
+const activityAtom = atom({ plugin: 'filetree-local', key: 'activity' }, emptyActivity())
+
+/** What a shell call's scan compares against, taken before the call runs (R6.1). */
+type Snapshot = { since: number; generation: number; dirs: string[]; names: Map<string, Set<string>> }
 
 // Module variables: lost on a hot reload, none of them needed for correctness.
 let paths: Paths = makePaths('posix')
@@ -39,6 +68,11 @@ const listLatest = new Map<string, number>()
 const unreadableToasted = new Set<string>()
 let view = { from: 0, max: 0 }
 let lastSurface: RenderSurface | undefined
+let settings: Settings = { reads: true, writes: true, follow: true }
+let glowTimer: Timer | null = null
+let glowSeq = 0
+/** Activity work, one tool call at a time in the order the calls ended (R6.5). */
+let queue: Promise<void> = Promise.resolve()
 
 // A refused call reads "<plugin>: $.fs.list: EACCES: ..."; the person needs only the reason.
 const message = (err: unknown): string => (err instanceof Error ? err.message : String(err)).replace(/^[\w-]+: \$\.[\w.]+: /, '')
@@ -95,6 +129,123 @@ async function refresh($: EngineInterface) {
   const t = await read($, treeAtom)
   const loaded = t.expanded.filter(id => t.nodes.find(n => n.id === id)?.loaded)
   await loadInDepthOrder($, loaded)
+}
+
+/** Lists the parent folder of each id, where that folder is loaded (R3.3). */
+async function relistParents($: EngineInterface, ids: readonly string[]) {
+  const t = await read($, treeAtom)
+  const parents = new Map<string, string>()
+  for (const id of ids) {
+    const dir = paths.parent(id)
+    if (dir !== null) parents.set(paths.key(dir), dir)
+  }
+  for (const dir of parents.values()) {
+    if (paths.same(dir, t.root) || t.nodes.some(n => n.id === dir && n.loaded)) await listDir($, dir)
+  }
+}
+
+/**
+ * Lists what is missing between the root and `id`, shallowest first (R4.1), and for a write the
+ * folder that holds it, loaded or not (R4.2). False once the root changed.
+ */
+async function uncover($: EngineInterface, id: string, generation: number, write: boolean, listed: Set<string>): Promise<boolean> {
+  const list = async (dir: string) => {
+    if (listed.has(dir)) return
+    listed.add(dir)
+    await listDir($, dir)
+  }
+  const { root } = await read($, treeAtom)
+  const dirs = ancestorsOf(paths, root, id)
+  for (const dir of dirs) {
+    let t = await read($, treeAtom)
+    if (t.generation !== generation) return false
+    // A folder the tree has not seen is new: its parent is listed again first.
+    if (!t.nodes.some(n => n.id === dir)) {
+      await list(paths.parent(dir)!)
+      t = await read($, treeAtom)
+    }
+    const node = t.nodes.find(n => n.id === dir)
+    if (node?.kind !== 'dir') return true
+    if (!node.loaded) await list(dir)
+  }
+  if (write) await list(dirs.at(-1) ?? root)
+  return (await read($, treeAtom)).generation === generation
+}
+
+async function reveal($: EngineInterface, ids: readonly string[], tone: Tone) {
+  const { generation } = await read($, treeAtom)
+  const listed = new Set<string>()
+  for (const id of ids) if (!(await uncover($, id, generation, tone === 'write', listed))) return
+  await flash($, ids, tone, generation)
+}
+
+async function snapshot($: EngineInterface): Promise<Snapshot> {
+  const since = await $.clock.now()
+  const t = await read($, treeAtom)
+  const dirs = scanDirs(t)
+  const names = new Map(dirs.map(dir => [paths.key(dir), new Set(t.nodes.filter(n => n.parent === dir).map(n => n.name))]))
+  return { since, generation: t.generation, dirs, names }
+}
+
+/** Relists the folders the snapshot saw and lights what changed in them (R6.3, R6.4). */
+async function scan($: EngineInterface, before: Snapshot) {
+  for (const dir of before.dirs) await listDir($, dir)
+  if (!settings.writes) return
+  const t = await read($, treeAtom)
+  if (t.generation !== before.generation) return
+  const ids: string[] = []
+  for (const dir of before.dirs) {
+    ids.push(...changedIn(before.names.get(paths.key(dir)), t.nodes.filter(n => n.parent === dir), before.since))
+    if (ids.length >= SCAN_LIT_LIMIT) break
+  }
+  if (ids.length > 0) await flash($, ids.slice(0, SCAN_LIT_LIMIT), 'write', before.generation)
+}
+
+async function flash($: EngineInterface, ids: readonly string[], tone: Tone, generation: number) {
+  const now = await $.clock.now()
+  // Safe to read outside the update: the queue is the only writer besides endGlow.
+  const before = await read($, activityAtom)
+  let lit: ActivityState | null = null
+  await update($, treeAtom, t => {
+    if (t.generation !== generation) return t
+    const r = light(before, t, paths, ids, tone, now)
+    if (r.activity === before) return t
+    lit = r.activity
+    const grown = { ...t, expanded: r.expanded }
+    if (lastSurface !== 'terminal') return grown
+    if (settings.follow) return { ...grown, scroll: null }
+    return { ...grown, scroll: keepTop(t, grown, view.from) }
+  })
+  if (lit === null) return
+  const next: ActivityState = lit
+  await update($, activityAtom, () => next)
+  glowTimer?.cancel()
+  const seq = ++glowSeq
+  glowTimer = $.clock.after(FLASH_MS, () => void endGlow($, seq).catch(() => undefined))
+}
+
+async function endGlow($: EngineInterface, seq: number) {
+  if (seq !== glowSeq) return
+  glowTimer = null
+  // The window freezes where the glow left it (R7.2); before the clear, so no redraw recentres it first.
+  if (settings.follow && lastSurface === 'terminal') {
+    await update($, treeAtom, t => (t.scroll === null ? { ...t, scroll: view.from } : t))
+  }
+  await update($, activityAtom, () => emptyActivity())
+}
+
+async function observe($: EngineInterface, e: ToolCallInput, result: ToolCallResult, before: Snapshot | null) {
+  const t = await read($, treeAtom)
+  const touch = touchOf(e, result, { paths, cwd: await cwd($), home, root: t.root })
+  if (!touch) return
+  if (touch.kind === 'read') {
+    if (settings.reads) await reveal($, touch.ids, 'read')
+  } else if (touch.kind === 'write') {
+    if (settings.writes) await reveal($, touch.ids, 'write')
+    else await relistParents($, touch.ids)
+  } else if (before) {
+    await scan($, before)
+  }
 }
 
 async function reroot($: EngineInterface, root: string, opts: { follow: boolean; open: boolean; focus?: boolean }) {
@@ -222,6 +373,8 @@ async function runFiletree($: EngineInterface, e: CommandRunInput): Promise<Comm
 }
 
 export const register: Register = (on, options) => {
+  settings = settingsOf(options)
+
   on('session.start', async ($, e, next) => {
     paths = makePaths(await detectPlatform($))
     home = await detectHome($, paths)
@@ -240,7 +393,31 @@ export const register: Register = (on, options) => {
       if (options.start !== 'off') await showPane($, { open: true })
       await listDir($, root)
     }
+    // A reload in the middle of a glow lost its timer: the glow still ends on time (R5.8).
+    const { until } = await read($, activityAtom)
+    if (until !== 0) {
+      const now = await $.clock.now()
+      glowTimer?.cancel()
+      const seq = ++glowSeq
+      if (until > now) glowTimer = $.clock.after(until - now, () => void endGlow($, seq).catch(() => undefined))
+      else await endGlow($, seq)
+    }
     return next(e)
+  })
+
+  // Observes without interfering (R1): the same `e` on, the same result back, the activity after.
+  on('tool.call', async ($, e, next) => {
+    const shell = e.tool === 'Bash' || e.tool === 'PowerShell'
+    const before = shell ? await snapshot($) : null
+    const result = await next(e)
+    queue = queue.then(() => observe($, e, result, before)).catch(() => undefined)
+    return result
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    void refresh($).catch(() => undefined)
+    return result
   })
 
   on('command.run', { command: 'filetree' }, async ($, e) => runFiletree($, e))
@@ -255,7 +432,9 @@ export const register: Register = (on, options) => {
       return <Box />
     }
     const t = await read($, treeAtom)
-    const layout = layoutPane(t, { surface: e.surface, bodyColumns: e.props.bodyColumns, bodyRows: e.props.scroll.bodyRows })
+    const activity = await read($, activityAtom)
+    const glow = isLive(activity, t.root, await $.clock.now()) ? { lit: activity.lit, focus: settings.follow ? activity.focus : null } : null
+    const layout = layoutPane(t, { surface: e.surface, bodyColumns: e.props.bodyColumns, bodyRows: e.props.scroll.bodyRows }, glow)
     view = { from: layout.from, max: layout.max }
     // The focus goes back to `open` after a nav button; a ring that cannot move is no failure.
     const nav = (k: KeyInput['key']) =>

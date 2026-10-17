@@ -193,7 +193,7 @@ A `spec-01` não chama nenhum executável.
 
 ## Data models
 
-O contrato de estado fica em `types/index.d.ts`, declarado em `interface PluginState` sob `'filetree-local'`. Cada fatia acrescenta as suas chaves. A `spec-01` define `tree` e `memory`.
+O contrato de estado fica em `types/index.d.ts`, declarado em `interface PluginState` sob `'filetree-local'`. Cada fatia acrescenta as suas chaves. A `spec-01` define `tree` e `memory`, e a `spec-02` define `activity`.
 
 ## Key decisions
 
@@ -215,8 +215,8 @@ O contrato de estado fica em `types/index.d.ts`, declarado em `interface PluginS
 | Spec | Fatia | Funcionalidades do original | Regras de R1 em jogo |
 |---|---|---|---|
 | `spec-01` | Painel, árvore e navegação | painel lateral, `/filetree [caminho]`, opção `start`, árvore preguiçosa e ordenação, ocultos, botões ↑ ⌂ ↻ ◉ ⊟ ⊘, seguir a cwd, coluna de data, teclado e mouse, copiar caminho, rodapé de seleção | R1.7, R1.9 |
-| `spec-02` | Atividade do Claude | brilho roxo/laranja/verde, seguir o Claude, chips de atividade, opções `activity` e `follow` | R1.3. O classificador do original é POSIX, e esta fatia precisa classificar comandos **PowerShell** |
-| `spec-03` | Status do git | cores por status, `+N/-N`, contagens por pasta, linha de branch, upstream e ahead/behind, ignorados, opção `hints` | R1.1, R1.2 (`git.exe`) |
+| `spec-02` | Atividade do Claude | brilho roxo (leitura por `Read`/`Grep`/`Glob`) e laranja (escrita por `Edit`/`Write`/`NotebookEdit` e varredura de shell), revelação, seguir o Claude, opções `activity` e `follow` | R1.3. Sem parser de comandos: o read-only vem do `isReadOnly` do engine, e as escritas do shell são observadas por `mtimeMs` |
+| `spec-03` | Status do git | cores por status, `+N/-N`, contagens por pasta, linha de branch, upstream e ahead/behind, ignorados, opção `hints`. **Atividade de git vinda da spec-02:** chips `committing…` → `committed <sha>` (e os demais verbos de `git`/`gh`), verde nos arquivos commitados ou preparados, tom da linha da branch e varredura de escrita via git status, que vê pastas fechadas | R1.1, R1.2 (`git.exe`) |
 | `spec-04` | Busca e colunas | busca com revelação, tamanhos (`Σ`), idade, opção `column`, glyphs Nerd Font (`glyphs`), dicas de hover nos botões | R1.7 |
 | `spec-05` | Abrir, preview e edição | abrir com app padrão, preview no painel, opções `open` e `edit` | R1.1, R1.2 (`explorer.exe`), R1.5, R1.6 |
 | `spec-06` | Contexto da seleção | seleção como contexto do prompt, `@menções` revelam arquivos | R1.4 |

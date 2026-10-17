@@ -43,10 +43,25 @@ export type TreeState = {
  */
 export type ExpansionMemory = Record<string, string[]>
 
-/** Shapes shared between pane.tsx and the rows.tsx Client. */
-export type ThemeKeyName = 'text' | 'subtle' | 'suggestion' | 'error'
+export type Tone = 'read' | 'write'
 
-export type Seg = { text: string; color?: ThemeKeyName; bold?: true; dim?: true }
+export type Glow = { tone: Tone; faint?: true }
+
+export type ActivityState = {
+  /** tree.root when the batch lit; under another root, lit is ignored. */
+  root: string
+  /** Node id → glow. */
+  lit: Record<string, Glow>
+  /** Last bright id of the latest batch; '' without a glow. */
+  focus: string
+  /** $.clock.now() at which the glow ends; 0 = no glow. */
+  until: number
+}
+
+/** Shapes shared between pane.tsx and the rows.tsx Client. */
+export type ThemeKeyName = 'text' | 'subtle' | 'suggestion' | 'error' | 'claude' | 'autoAccept'
+
+export type Seg = { text: string; color?: ThemeKeyName; bold?: true; dim?: true; glow?: 'bright' | 'faint' }
 
 export type RowSpec = { id: string; segs: Seg[]; active: boolean }
 
@@ -71,6 +86,7 @@ declare module 'claude-code' {
     'filetree-local': {
       tree: TreeState
       memory: ExpansionMemory
+      activity: ActivityState
     }
   }
 }

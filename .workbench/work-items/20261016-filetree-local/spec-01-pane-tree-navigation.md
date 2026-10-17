@@ -673,7 +673,7 @@ Verificação manual, numa sessão real com o mod carregado via `CLAUDE_CODE_PLU
 
 ## Out of scope
 
-- Brilho de atividade, seguir o Claude e chips: spec-02.
+- Brilho de atividade e seguir o Claude: spec-02. Chips de atividade (só de git): spec-03.
 - Status do git e linha de branch: spec-03.
 - Busca, tamanhos, idade, glyphs Nerd Font e dicas de hover nos botões: spec-04.
 - Abrir arquivo, preview e edição: spec-05. Aqui, duplo clique e `return` em arquivo só selecionam.
