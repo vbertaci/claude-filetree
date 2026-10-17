@@ -100,7 +100,8 @@ export function markUnreadable(t: TreeState, dir: string, msg: string): TreeStat
   return { ...t, nodes: t.nodes.map(n => (n.id === dir ? { ...n, loaded: true, error: msg } : n)) }
 }
 
-export function visibleRows(t: TreeState): Row[] {
+/** The rows the person sees; with `keep`, only those ids, folders open when a kept child shows (spec-06 R3.2). */
+export function visibleRows(t: TreeState, keep: ReadonlySet<string> | null = null): Row[] {
   const byParent = new Map<string, FileNode[]>()
   for (const n of t.nodes) {
     const kids = byParent.get(n.parent)
@@ -112,7 +113,9 @@ export function visibleRows(t: TreeState): Row[] {
   const walk = (parent: string, depth: number) => {
     for (const node of byParent.get(parent) ?? []) {
       if (node.hidden && !t.showHidden) continue
-      const isOpen = node.kind === 'dir' && open.has(node.id)
+      if (keep && !keep.has(node.id)) continue
+      const kids = (byParent.get(node.id) ?? []).filter(k => (!k.hidden || t.showHidden) && (!keep || keep.has(k.id)))
+      const isOpen = node.kind === 'dir' && (keep ? node.loaded && kids.length > 0 : open.has(node.id))
       rows.push({ id: node.id, depth, node, isOpen })
       if (isOpen && node.loaded) walk(node.id, depth + 1)
     }

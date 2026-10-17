@@ -13,7 +13,7 @@ import type {
   ToolCallResult,
 } from 'claude-code'
 
-import type { ActivityState, ExpansionMemory, GitChip, GitState, RowsMessage, Tone } from '../types'
+import type { ActivityState, ExpansionMemory, GitChip, GitState, RowsMessage, SearchState, Tone } from '../types'
 import {
   FLASH_MS,
   SCAN_LIT_LIMIT,
@@ -59,6 +59,7 @@ import {
 } from './git'
 import { type Paths, detectHome, detectPlatform, executable, paths as makePaths } from './os'
 import { layoutPane, renderPane, rootLabel } from './pane'
+import { JUMP_LIMIT, PRUNE, REVEAL_LIMIT, WALK_DEPTH, WALK_LIMIT, filterOf, matches, parseFiles, termOf } from './search'
 import {
   type Effect,
   type KeyInput,
@@ -86,6 +87,7 @@ const memoryAtom = atom({ plugin: 'filetree-local', key: 'memory' }, {} as Expan
 const activityAtom = atom({ plugin: 'filetree-local', key: 'activity' }, emptyActivity())
 const gitAtom = atom({ plugin: 'filetree-local', key: 'git' }, emptyGit())
 const chipAtom = atom({ plugin: 'filetree-local', key: 'chip' }, null as GitChip | null)
+const searchAtom = atom({ plugin: 'filetree-local', key: 'search' }, { query: '' } as SearchState)
 
 /** What a shell call's scan compares against, taken before the call runs (R6.1). */
 type Snapshot = { since: number; generation: number; dirs: string[]; names: Map<string, Set<string>>; git: GitState }
@@ -116,6 +118,8 @@ let ticker: Timer | null = null
 /** True while a tick's read runs, so the next tick skips (spec-05 R1.5). */
 let ticking = false
 let gitWatch: Timer | null = null
+/** The files of a root for the search; never in $.state, rebuilt on demand (spec-06 R2.1, R2.7). */
+let index: { root: string; ids: Promise<string[] | null> } | null = null
 
 // A refused call reads "<plugin>: $.fs.list: EACCES: ..."; the person needs only the reason.
 const message = (err: unknown): string => (err instanceof Error ? err.message : String(err)).replace(/^[\w-]+: \$\.[\w.]+: /, '')
@@ -169,11 +173,113 @@ async function loadInDepthOrder($: EngineInterface, dirs: readonly string[]) {
 }
 
 async function refresh($: EngineInterface) {
+  dropIndex()
   const t = await read($, treeAtom)
   const loaded = t.expanded.filter(id => t.nodes.find(n => n.id === id)?.loaded)
   await loadInDepthOrder($, loaded)
   await refreshGit($)
+  const { query } = await read($, searchAtom)
+  if (termOf(query) !== '') await runSearch($, query)
 }
+
+function dropIndex() {
+  index = null
+}
+
+/** Every file under the root, breadth first, by $.fs.list alone; links and PRUNE are skipped (spec-06 R2.3, R5.2). */
+async function walkFiles($: EngineInterface, root: string): Promise<string[]> {
+  const prune = new Set(PRUNE.map(name => name.toLowerCase()))
+  const files: string[] = []
+  let level = [root]
+  for (let d = 0; d < WALK_DEPTH && level.length > 0; d++) {
+    const next: string[] = []
+    for (const dir of level) {
+      // A folder that cannot be listed is skipped without a toast.
+      const entries = await $.fs.list(paths.native(dir)).catch(() => [] as FsEntry[])
+      for (const entry of entries) {
+        if (entry.isLink) continue
+        const id = paths.join(dir, entry.name)
+        if (entry.kind === 'dir' && !prune.has(entry.name.toLowerCase())) next.push(id)
+        else if (entry.kind === 'file') {
+          files.push(id)
+          if (files.length >= WALK_LIMIT) return files
+        }
+      }
+    }
+    level = next
+  }
+  return files
+}
+
+/** The index of the current root, built once; a failed ls-files is dropped so the next search tries again (spec-06 R2.1–R2.4). */
+async function indexOf($: EngineInterface): Promise<string[]> {
+  const { root } = await read($, treeAtom)
+  if (index === null || !paths.same(index.root, root)) {
+    const g = await read($, gitAtom)
+    const ids =
+      g.root === root && g.top !== ''
+        ? runGit($, root, 'ls-files', ['-co', '--exclude-standard', '-z'], 10_000).then(
+            r => (r.exitCode === 0 ? parseFiles(paths, root, r.stdout, r.isStdoutTruncated) : null),
+            () => null,
+          )
+        : walkFiles($, root)
+    index = { root, ids }
+  }
+  const built = index
+  const ids = await built.ids
+  if (ids !== null) return ids
+  if (index === built) dropIndex()
+  return []
+}
+
+/** Reveals the first results without opening, lighting or moving anything; a search outrun by the text lists nothing (spec-06 R3.4–R3.6). */
+async function runSearch($: EngineInterface, query: string): Promise<string[]> {
+  const term = termOf(query)
+  if (term === '') return []
+  const { root, generation } = await read($, treeAtom)
+  const ids = await indexOf($)
+  if ((await read($, searchAtom)).query !== query) return []
+  const hits = matches(paths, root, ids, term)
+  const listed = new Set<string>()
+  for (const id of hits.slice(0, REVEAL_LIMIT)) {
+    if (!(await uncover($, id, generation, false, listed))) return hits
+    const t = await read($, treeAtom)
+    const parent = paths.parent(id)
+    const loaded = parent !== null && (paths.same(parent, root) || t.nodes.some(n => n.id === parent && n.loaded))
+    // A result its loaded folder does not show yet is new: that folder is listed again, once.
+    if (parent !== null && loaded && !t.nodes.some(n => n.id === id) && !listed.has(parent)) {
+      listed.add(parent)
+      await listDir($, parent)
+    }
+  }
+  return hits
+}
+
+/** Enter: the cursor on the first result, the way to it open, the search cleared (spec-06 R4). */
+async function jump($: EngineInterface, query: string) {
+  if (termOf(query) === '') {
+    await update($, searchAtom, () => ({ query: '' }))
+    return
+  }
+  const hits = await runSearch($, query)
+  await update($, treeAtom, t => {
+    const present = new Set(t.nodes.map(n => n.id))
+    const first = hits.filter(id => present.has(id)).slice(0, JUMP_LIMIT)
+    if (first.length === 0) return t
+    const open = new Set(t.expanded)
+    for (const id of first) for (const dir of ancestorsOf(paths, t.root, id)) open.add(dir)
+    return { ...t, expanded: [...open], cursor: first[0]!, scroll: null }
+  })
+  await update($, searchAtom, () => ({ query: '' }))
+  await $.ui.focus({ requestId: PANE, key: 'nav-o' }).catch(() => undefined)
+}
+
+async function search($: EngineInterface, query: string) {
+  await update($, searchAtom, () => ({ query }))
+  await runSearch($, query)
+}
+
+const focusSearch = ($: EngineInterface) => $.ui.focus({ requestId: PANE, key: 'q' }).catch(() => undefined)
 
 /** Whether the pane draws now (spec-05 R1.4, R2.5). */
 async function paneVisible($: EngineInterface): Promise<boolean> {
@@ -487,9 +593,11 @@ async function observe($: EngineInterface, e: ToolCallInput, result: ToolCallRes
   } else if (touch.kind === 'write') {
     if (settings.writes) await reveal($, touch.ids, 'write')
     else await relistParents($, touch.ids)
+    dropIndex()
     void refreshGit($).catch(() => undefined)
   } else if (before) {
     await shellActivity($, before, result)
+    dropIndex()
   }
 }
 
@@ -507,9 +615,13 @@ async function reroot($: EngineInterface, root: string, opts: { follow: boolean;
   }
   const expanded = ((await read($, memoryAtom))[paths.key(root)] ?? []).map(rel => paths.join(root, rel))
   await update($, treeAtom, t => ({ ...emptyTree(root, t.showHidden), follow: opts.follow, generation: t.generation + 1, expanded }))
+  dropIndex()
   await showPane($, opts)
   await loadInDepthOrder($, expanded)
   await refreshGit($)
+  // The text stays, and the search runs again on the new root (spec-06 R1.7).
+  const { query } = await read($, searchAtom)
+  if (termOf(query) !== '') await runSearch($, query)
 }
 
 async function cwd($: EngineInterface): Promise<string> {
@@ -540,9 +652,10 @@ async function apply($: EngineInterface, effect: Effect | undefined, surface: Re
 }
 
 async function key($: EngineInterface, input: KeyInput, surface: RenderSurface) {
+  const term = termOf((await read($, searchAtom)).query)
   let effect: Effect | undefined
   await update($, treeAtom, t => {
-    const r = navigate(t, visibleRows(t), input)
+    const r = navigate(t, visibleRows(t, filterOf(paths, t, term)), input)
     effect = r.effect
     return r.tree
   })
@@ -701,12 +814,14 @@ export const register: Register = (on, options) => {
     const git = g.root === t.root ? { state: g, hints } : null
     const c = await read($, chipAtom)
     const chip = c !== null && c.root === t.root && now - c.at < CHIP_MS ? c : null
-    const layout = layoutPane(t, { surface: e.surface, bodyColumns: e.props.bodyColumns, bodyRows: e.props.scroll.bodyRows }, glow, git, paths, chip)
+    const { query } = await read($, searchAtom)
+    const keep = filterOf(paths, t, termOf(query))
+    const layout = layoutPane(t, { surface: e.surface, bodyColumns: e.props.bodyColumns, bodyRows: e.props.scroll.bodyRows }, glow, git, paths, chip, keep)
     view = { from: layout.from, max: layout.max }
     // The focus goes back to `open` after a nav button; a ring that cannot move is no failure.
     const nav = (k: KeyInput['key']) =>
       key($, { key: k }, e.surface).then(() => $.ui.focus({ requestId: PANE, key: 'nav-o' }).catch(() => undefined))
-    return renderPane($, e, paths, t, layout, git, glow, chip, {
+    return renderPane($, e, paths, t, layout, git, glow, chip, query, {
       up: async () => {
         const up = paths.parent(t.root)
         if (up !== null) await reroot($, up, { follow: false, open: false })
@@ -717,6 +832,10 @@ export const register: Register = (on, options) => {
       collapse: () => update($, treeAtom, cur => collapseAll(paths, cur)),
       unselect: () => update($, treeAtom, cur => ({ ...cur, selected: '' })),
       nav,
+      search: value => search($, value),
+      jump: value => jump($, value),
+      clear: () => update($, searchAtom, () => ({ query: '' })),
+      focusSearch: () => focusSearch($),
     })
   })
 
@@ -725,7 +844,8 @@ export const register: Register = (on, options) => {
     const t = await read($, treeAtom)
     const msg = parseMessage(e.data, new Set(t.nodes.map(n => n.id)))
     if (!msg) return {}
-    if (msg.kind === 'key') await key($, msg, e.surface)
+    if (msg.kind === 'key' && msg.key === 's') await focusSearch($)
+    else if (msg.kind === 'key') await key($, msg, e.surface)
     else if (msg.kind === 'press') await press($, msg, e.surface)
     else await update($, treeAtom, cur => ({ ...cur, scroll: Math.round(msg.fraction * view.max) }))
     return {}

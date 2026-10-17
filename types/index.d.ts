@@ -113,6 +113,11 @@ export type GitChip = {
   at: number
 }
 
+export type SearchState = {
+  /** What the search box holds, as typed; survives a reroot (spec-06 R1.7). */
+  query: string
+}
+
 /** Shapes shared between pane.tsx and the rows.tsx Client. */
 export type ThemeKeyName = 'text' | 'subtle' | 'suggestion' | 'error' | 'claude' | 'autoAccept' | 'success' | 'warning' | 'merged'
 
@@ -144,6 +149,7 @@ declare module 'claude-code' {
       activity: ActivityState
       git: GitState
       chip: GitChip | null
+      search: SearchState
     }
   }
 }

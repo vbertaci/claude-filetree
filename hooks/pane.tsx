@@ -3,6 +3,7 @@ import type { EngineInterface, RenderElement, RenderInput } from 'claude-code'
 import type { GitChip, GitLetter, GitState, Glow, RowSpec, RowsProps, Seg, ThemeKeyName, Tone, TreeState } from '../types'
 import { BRANCH_ID, type NodeGit, gitOf } from './git'
 import type { Paths } from './os'
+import { termOf } from './search'
 import { type Row, formatDate, visibleRows, windowOf } from './tree'
 
 export const DESKTOP_ROW_CAP = 1500
@@ -41,6 +42,10 @@ export type PaneActions = {
   collapse: () => Promise<unknown>
   unselect: () => Promise<unknown>
   nav: (key: 'down' | 'up' | 'left' | 'right' | 'return') => Promise<unknown>
+  search: (value: string) => Promise<unknown>
+  jump: (value: string) => Promise<unknown>
+  clear: () => Promise<unknown>
+  focusSearch: () => Promise<unknown>
 }
 
 const GLYPH = { dir: '■', file: '·', link: '↪', other: '◇' } as const
@@ -165,8 +170,9 @@ export function layoutPane(
   git: GitView,
   paths: Paths,
   chip: GitChip | null,
+  keep: ReadonlySet<string> | null,
 ): Layout {
-  const rows = visibleRows(t)
+  const rows = visibleRows(t, keep)
   const total = Math.max(1, view.bodyColumns)
   const extra = extraOf(git)
   const repo = git !== null && git.state.top !== '' ? git.state : null
@@ -243,9 +249,10 @@ export function renderPane(
   git: GitView,
   glow: GlowView,
   chip: GitChip | null,
+  query: string,
   actions: PaneActions,
 ): RenderElement {
-  const { Box, Text, Button, Client } = $.ui.resolve(e)
+  const { Box, Text, Button, Input, Client } = $.ui.resolve(e)
   const terminal = e.surface === 'terminal'
 
   // The branch and the root's totals; the upstream is the first thing cut (spec-03 R6).
@@ -318,6 +325,14 @@ export function renderPane(
         <Button key="nav-h" plain dimColor hotkey="h" onPress={() => actions.nav('left')}>←</Button>
         <Button key="nav-l" plain dimColor hotkey="l" onPress={() => actions.nav('right')}>→</Button>
         <Button key="nav-o" plain dimColor hotkey="o" autoFocus onPress={() => actions.nav('return')}>open</Button>
+        {/* The search shares the row and gives way first, so the tree keeps its rows (spec-06 R1.1, R1.4). */}
+        <Box flexDirection="row" flexGrow={1} flexShrink={1} overflow="hidden">
+          <Button key="nav-s" plain dimColor hotkey="s" onPress={actions.focusSearch}>/</Button>
+          <Box flexGrow={1} flexShrink={1}>
+            <Input key="q" placeholder="search" submitLabel="jump" value={query} onInput={actions.search} onSubmit={actions.jump} />
+          </Box>
+          {termOf(query) !== '' && <Button key="clear" plain dimColor onPress={actions.clear}>×</Button>}
+        </Box>
       </Box>
       {terminal ? (
         <Client key="rows" module="./rows.tsx" props={layout.props} height={Math.max(1, layout.props.rows.length)} />

@@ -1,6 +1,6 @@
 {
   "name": "filetree-local",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "IDE-style file tree pane for Claude Code, local build",
   "author": { "name": "w4rl0ck" },
   "types": "./types/index.d.ts",

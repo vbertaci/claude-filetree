@@ -58,6 +58,21 @@ describe('visibleRows (R3.4, R3.5)', () => {
     const rows = visibleRows({ ...sample(), showHidden: false })
     expect(rows.map(r => r.node.name)).toEqual(['src', 'lib', 'a.ts', 'b.md'])
   })
+
+  test('keep: only kept ids; a folder is open when a kept child shows, whatever expanded says (spec-06 R3.1, R3.2)', () => {
+    let t = replaceChildren(P, sample(), 'C:/p/src/lib', toNodes(P, 'C:/p/src/lib', [entry('x.ts')]))
+    t = { ...t, expanded: [] }
+    const keep = new Set(['C:/p/src', 'C:/p/src/lib', 'C:/p/src/lib/x.ts', 'C:/p/.git'])
+    const rows = visibleRows(t, keep)
+    expect(rows.map(r => `${r.depth}:${r.node.name}:${r.isOpen}`)).toEqual(['0:.git:false', '0:src:true', '1:lib:true', '2:x.ts:false'])
+    expect(visibleRows({ ...t, showHidden: false }, keep).map(r => r.node.name)).toEqual(['src', 'lib', 'x.ts'])
+    // An open folder with no kept child shows closed.
+    expect(visibleRows(sample(), new Set(['C:/p/src'])).map(r => `${r.node.name}:${r.isOpen}`)).toEqual(['src:false'])
+  })
+
+  test('keep null is the same as no keep (spec-06 R3.3)', () => {
+    expect(visibleRows(sample(), null)).toEqual(visibleRows(sample()))
+  })
 })
 
 describe('replaceChildren (R7.2, R7.3)', () => {

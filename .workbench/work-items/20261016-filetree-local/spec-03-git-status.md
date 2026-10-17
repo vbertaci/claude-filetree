@@ -722,5 +722,5 @@ Verificação manual, numa sessão real com o mod carregado:
 - Atividade de git (chips, verde, brilho da linha da branch, varredura de escrita por git): `spec-04-git-activity.md`.
 - Status de sub-repositórios e submódulos dentro da raiz.
 - Vigiar `.git/index` e `HEAD` (`watchPaths`): `spec-05-auto-refresh.md`, junto da releitura periódica.
-- Glyph colorido pelo status e glyphs Nerd Font (spec-06).
+- Glyph colorido pelo status e glyphs Nerd Font (spec-07).
 - Mitigar filtros `clean` de `.gitattributes`.

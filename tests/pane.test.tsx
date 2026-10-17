@@ -584,7 +584,7 @@ const glowOf = async (ui: any) =>
  * The plugin's hooks taken straight from `register`, over a stand-in `$`: state in a map, a fixed
  * clock, every other call a no-op. Only here can a test hold the objects a hook passes and returns.
  */
-function direct(state: Record<string, unknown> = {}) {
+function direct(state: Record<string, unknown> = {}, extra: Record<string, any> = {}) {
   const hooks: Record<string, any> = {}
   register(((event: string, a: any, b?: any) => {
     hooks[event] = b ?? a
@@ -602,6 +602,7 @@ function direct(state: Record<string, unknown> = {}) {
         return { isSet: true, version: versions[ref.key] }
       },
     },
+    ...extra,
   }
   const noop = new Proxy({}, { get: () => async () => ({}) })
   const $ = new Proxy(nouns, { get: (t, noun: string) => t[noun] ?? noop })
@@ -1843,5 +1844,327 @@ describe('watching git (spec-05 R2, R4)', () => {
     await clock.advance(8_900)
     await clock.settle()
     expect(reads(log)).toBe(3)
+  })
+})
+
+const typeIn = ($: any, text: string) => $.ui.input({ plugin: PLUGIN, key: 'q', text, kind: 'change' })
+const submit = ($: any, text: string) => $.ui.input({ plugin: PLUGIN, key: 'q', text })
+const inputOf = async (ui: any) => (await ui.find({ type: 'Input', key: 'q' }))?.props
+const idsOf = async (ui: any) => (await rowsOf(ui)).rows.map(r => r.id)
+const activeOf = async (ui: any) => (await rowsOf(ui)).rows.find(r => r.active)?.id
+/** The search's own ls-files runs, not the untracked read of spec-03. */
+const lsFiles = (log: Log) => log.runs.filter(a => a[6] === 'ls-files' && a[7] === '-co')
+
+describe('the search box (spec-06 R1)', () => {
+  test('nav-s, the Input and clear share the nav row; the tree keeps its rows', { options: { hints: 'off' } }, async ($, on) => {
+    world(on, {
+      cwd: 'C:/m',
+      dirs: { 'C:/m': Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`f${String(i).padStart(4, '0')}.txt`, 'file' as const])) },
+    })
+    await start($, 'C:/m')
+    const ui = await mount($, 'terminal', pane(60, 20))
+    expect((await rowsOf(ui)).rows).toHaveLength(18)
+    const s = (await ui.find({ type: 'Button', key: 'nav-s' }))?.props
+    expect([s?.plain, s?.dimColor, s?.hotkey]).toEqual([true, true, 's'])
+    const q = await inputOf(ui)
+    expect([q?.placeholder, q?.submitLabel, q?.value]).toEqual(['search', 'jump', ''])
+    expect(await ui.find({ type: 'Button', key: 'clear' })).toBe(undefined)
+
+    await typeIn($, 'f00')
+    expect((await inputOf(ui))?.value).toBe('f00')
+    expect(await ui.find({ type: 'Button', key: 'clear' })).toBeDefined()
+    expect((await rowsOf(ui)).rows).toHaveLength(18)
+  })
+
+  test('typing saves the text and filters; only spaces changes nothing; clear empties it and moves nothing (G2)', async ($, on) => {
+    const { log } = world(on, PROJECT())
+    await start($)
+    const ui = await mount($)
+    await ui.key({ key: 'j', in: 'rows' })
+    const before = await rowsOf(ui)
+    const shown = await names(ui)
+    log.lists.length = 0
+    await typeIn($, '  ')
+    expect(await rowsOf(ui)).toEqual(before)
+    expect(await ui.find({ type: 'Button', key: 'clear' })).toBe(undefined)
+    expect(log.lists).toEqual([])
+
+    await typeIn($, 'x.ts')
+    expect(await names(ui)).toEqual(['▾ ■ src', '▾ ■ lib', '· x.ts'])
+    await ui.press({ key: 'clear' })
+    expect((await inputOf(ui))?.value).toBe('')
+    expect(await names(ui)).toEqual(shown)
+    expect(await activeOf(ui)).toBe('C:/p/.git')
+  })
+
+  test('the text survives a reroot and filters the new root (R1.7)', async ($, on) => {
+    world(on, PROJECT())
+    await start($)
+    const ui = await mount($)
+    await typeIn($, 'q.txt')
+    expect((await rowsOf(ui)).empty).toBe('empty')
+    await ui.press({ key: 'up' })
+    expect((await inputOf(ui))?.value).toBe('q.txt')
+    expect(await names(ui)).toEqual(['▾ ■ q', '· q.txt'])
+  })
+})
+
+describe('the index (spec-06 R2, R5)', () => {
+  test('in a repository: one ls-files over the whole root by the fixed argv, reused by the next search', async ($, on) => {
+    const { log } = world(on, REPO())
+    await start($)
+    const ui = await mount($)
+    await typeIn($, 'x')
+    expect(lsFiles(log)).toEqual([[...FLAGS, 'C:\\p', 'ls-files', '-co', '--exclude-standard', '-z']])
+    expect(await idsOf(ui)).toEqual(['C:/p/src', 'C:/p/src/lib', 'C:/p/src/lib/x.ts'])
+    await typeIn($, 'x.')
+    expect(lsFiles(log)).toHaveLength(1)
+  })
+
+  test('a failing or refused ls-files leaves the loaded matches and tries again on the next search', async ($, on) => {
+    let failure: GitAnswer = { exitCode: 128 }
+    const { log } = world(on, { ...PROJECT(), git: (sub, argv) => (sub === 'ls-files' && argv[7] === '-co' ? failure : repo()(sub)) })
+    await start($)
+    const ui = await mount($)
+    await typeIn($, 'b')
+    expect(await idsOf(ui)).toEqual(['C:/p/b.md'])
+    failure = 'reject'
+    await typeIn($, 'b.')
+    expect(await idsOf(ui)).toEqual(['C:/p/b.md'])
+    await typeIn($, 'b.m')
+    expect(lsFiles(log)).toHaveLength(3)
+  })
+
+  test('outside a repository: a walk by fs.list alone, past pruned folders and links, 6 levels deep', async ($, on) => {
+    const dirs: World['dirs'] = { 'C:/w': { d1: 'dir', 'L1.txt': 'file', Node_Modules: 'dir', ln: 'link' }, 'C:/w/Node_Modules': { 'nm.txt': 'file' } }
+    let at = 'C:/w'
+    for (let level = 1; level <= 6; level++) {
+      at = `${at}/d${level}`
+      dirs[at] = level < 6 ? { [`d${level + 1}`]: 'dir', [`L${level + 1}.txt`]: 'file' } : { 'L7.txt': 'file' }
+    }
+    const { log } = world(on, { cwd: 'C:/w', dirs })
+    await start($, 'C:/w')
+    const ui = await mount($, 'desktop')
+    log.lists.length = 0
+    log.stats.length = 0
+    log.runs.length = 0
+    await typeIn($, 'txt')
+    // The walk, then the reveal listing the folders the tree has not loaded.
+    expect(log.lists.slice(0, 6)).toEqual(['C:/w', 'C:/w/d1', 'C:/w/d1/d2', 'C:/w/d1/d2/d3', 'C:/w/d1/d2/d3/d4', 'C:/w/d1/d2/d3/d4/d5'])
+    expect(log.lists.some(p => p.endsWith('Node_Modules') || p.endsWith('/ln') || p.endsWith('/d6'))).toBe(false)
+    expect(log.stats).toEqual([])
+    expect(log.runs).toEqual([])
+    const ids = await idsOf(ui)
+    expect(ids).toContain('C:/w/d1/d2/d3/d4/d5/L6.txt')
+    expect(ids.some(id => id.endsWith('L7.txt') || id.endsWith('nm.txt'))).toBe(false)
+  })
+
+  test('the walk stops at 20 000 files', async ($, on) => {
+    const big = Object.fromEntries(Array.from({ length: 20_000 }, (_, i) => [`f${i}.txt`, 'file' as const]))
+    const { log } = world(on, { cwd: 'C:/m', dirs: { 'C:/m': { big: 'dir', zz: 'dir' }, 'C:/m/big': big, 'C:/m/zz': { 'last.txt': 'file' } } })
+    await start($, 'C:/m')
+    const ui = await mount($)
+    await typeIn($, 'last')
+    expect((await rowsOf(ui)).empty).toBe('empty')
+    expect(log.lists.includes('C:/m/zz')).toBe(false)
+  })
+
+  test('↻, a write and a tick drop the index; with a search on, the refresh searches again (R2.5, R2.6)', async ($, on) => {
+    const { log, clock } = world(on, REPO())
+    await start($)
+    const ui = await mount($)
+    await typeIn($, 'x')
+    expect(lsFiles(log)).toHaveLength(1)
+    await ui.press({ key: 'refresh' })
+    expect(lsFiles(log)).toHaveLength(2)
+    await call($, clock, editOf('C:/p/b.md'))
+    expect(lsFiles(log)).toHaveLength(2)
+    await typeIn($, 'x.')
+    expect(lsFiles(log)).toHaveLength(3)
+    await clock.advance(5_000)
+    await clock.settle()
+    expect(lsFiles(log)).toHaveLength(4)
+  })
+})
+
+describe('filter and reveal (spec-06 R3)', () => {
+  test('hidden nodes stay hidden under the filter', async ($, on) => {
+    world(on, PROJECT())
+    await start($)
+    const ui = await mount($)
+    await typeIn($, 'git')
+    expect(await idsOf(ui)).toEqual(['C:/p/.git'])
+    await ui.press({ key: 'hidden' })
+    expect((await rowsOf(ui)).empty).toBe('empty')
+  })
+
+  test('of 70 results the first 60 are revealed; expanded, cursor and glow stay (desktop)', async ($, on) => {
+    const dirs: World['dirs'] = { 'C:/r': { 'a.txt': 'file' } }
+    for (let i = 0; i < 70; i++) {
+      const name = `d${String(i).padStart(2, '0')}`
+      dirs['C:/r']![name] = 'dir'
+      dirs[`C:/r/${name}`] = { 'hit.txt': 'file' }
+    }
+    world(on, { cwd: 'C:/r', dirs })
+    await start($, 'C:/r')
+    const ui = await mount($, 'desktop')
+    await ui.key({ key: 'j', in: 'rows' })
+    expect(await inputOf(ui)).toBeDefined()
+    await typeIn($, 'hit')
+    const ids = await idsOf(ui)
+    expect(ids.filter(id => id.endsWith('hit.txt'))).toHaveLength(60)
+    expect(ids).toContain('C:/r/d59/hit.txt')
+    expect(ids.includes('C:/r/d60/hit.txt')).toBe(false)
+    expect(await glowOf(ui)).toEqual({})
+    expect(await activeOf(ui)).toBe('C:/r/d00')
+    await ui.press({ key: 'clear' })
+    const rows = await names(ui)
+    expect(rows).toHaveLength(71)
+    expect(rows.some(r => r.startsWith('▾'))).toBe(false)
+  })
+
+  test('a search outrun by the text lists nothing (R3.6, G1)', async ($, on) => {
+    const w: World = {
+      cwd: 'C:/s',
+      dirs: { 'C:/s': { one: 'dir', two: 'dir' }, 'C:/s/one': { 'a.txt': 'file' }, 'C:/s/two': { 'abc.txt': 'file' } },
+      git: sub => (sub === 'rev-parse' ? '\nC:/s\n' : sub === 'status' ? Z('## main') : sub === 'ls-files' ? Z('one/a.txt', 'two/abc.txt') : ''),
+      gitDelays: { 'ls-files': [1_000] },
+    }
+    const { log, clock } = world(on, w)
+    await start($, 'C:/s')
+    const ui = await mount($)
+    log.lists.length = 0
+    // The kit runs one Input edit at a time, so the text changes under the held search by `clear`.
+    const typing = typeIn($, 'a')
+    await clock.settle()
+    const clearing = ui.press({ key: 'clear' })
+    await clock.settle()
+    await clock.advance(1_000)
+    await Promise.all([typing, clearing])
+    expect((await inputOf(ui))?.value).toBe('')
+    expect(log.lists).toEqual([])
+    await typeIn($, 'abc')
+    expect(lsFiles(log)).toHaveLength(1)
+    expect(log.lists).toEqual(['C:/s/two'])
+    expect(await idsOf(ui)).toEqual(['C:/s/two', 'C:/s/two/abc.txt'])
+  })
+
+  test('keys walk the filtered rows; the shell scan uses the unfiltered ones (R3.7, R3.8)', async ($, on) => {
+    const { log, clock } = world(on, PROJECT())
+    await start($)
+    const ui = await mount($)
+    await typeIn($, 'x.ts')
+    for (let i = 0; i < 3; i++) await ui.key({ key: 'j', in: 'rows' })
+    expect(await activeOf(ui)).toBe('C:/p/src/lib/x.ts')
+    log.lists.length = 0
+    await call($, clock, shell('stuff'))
+    expect(log.lists).toEqual([ROOT])
+  })
+})
+
+describe('jump (spec-06 R4)', () => {
+  test('Enter opens the way to the first result, puts the cursor there and empties the text', async ($, on) => {
+    world(on, PROJECT())
+    await start($)
+    const ui = await mount($)
+    await pressOpen(ui, 'C:/p/b.md')
+    await typeIn($, 'x.ts')
+    await submit($, 'x.ts')
+    expect(await activeOf(ui)).toBe('C:/p/src/lib/x.ts')
+    expect((await inputOf(ui))?.value).toBe('')
+    const rows = await names(ui)
+    expect(rows).toContain('▾ ■ src')
+    expect(rows).toContain('▾ ■ lib')
+    expect(rows).toContain('· b.md')
+    expect(await ui.find({ type: 'Text', text: 'selected: b.md' })).toBeDefined()
+  })
+
+  test('with no result Enter only empties the text; the cursor and the folders stay', async ($, on) => {
+    world(on, PROJECT())
+    await start($)
+    const ui = await mount($)
+    await ui.key({ key: 'j', in: 'rows' })
+    const before = await names(ui)
+    await typeIn($, 'zzz')
+    await submit($, 'zzz')
+    expect((await inputOf(ui))?.value).toBe('')
+    expect(await activeOf(ui)).toBe('C:/p/.git')
+    expect(await names(ui)).toEqual(before)
+  })
+})
+
+/** Tags that draw as plain data, so a test can find an element by key and call its closures. */
+const ELEMENTS = new Proxy({}, { get: (_, type: string) => (props: any) => ({ type, props }) })
+const findKey = (node: any, key: string): any => {
+  if (node === null || typeof node !== 'object') return undefined
+  if (Array.isArray(node)) {
+    for (const n of node) {
+      const found = findKey(n, key)
+      if (found) return found
+    }
+    return undefined
+  }
+  return node.props?.key === key ? node : findKey(node.props?.children, key)
+}
+/**
+ * The hooks over `direct`, with a `ui` that records where `$.ui.focus` asks to go, which the kit
+ * cannot show (spec-06 R1.2, R4.2), and a posix world for the walk. /p holds src/a.ts, src loaded.
+ */
+function focusWorld(search: string) {
+  const focuses: string[] = []
+  const ui = new Proxy(
+    { resolve: () => ELEMENTS, focus: async (a: { key: string }) => (focuses.push(a.key), {}) } as Record<string, any>,
+    { get: (t, k: string) => t[k] ?? (async () => ({})) },
+  )
+  const dirs: Record<string, [string, 'dir' | 'file'][]> = { '/p': [['src', 'dir']], '/p/src': [['a.ts', 'file']] }
+  // The module's platform is whatever an earlier direct test left: '\p' and '/p' are one folder here.
+  const fs = { list: async (p: string) => (dirs[p.replace(/\\/g, '/')] ?? []).map(([name, kind]) => ({ name, kind, isLink: false, size: 1, mtimeMs: 0 })) }
+  const node = (id: string, parent: string, name: string, kind: 'dir' | 'file') => ({ id, parent, name, kind, hidden: false, mtimeMs: 0, loaded: kind === 'dir' })
+  const state: Record<string, unknown> = {
+    tree: {
+      root: '/p',
+      follow: false,
+      nodes: [node('/p/src', '/p', 'src', 'dir'), node('/p/src/a.ts', '/p/src', 'a.ts', 'file')],
+      expanded: [],
+      cursor: '',
+      selected: '',
+      showHidden: true,
+      scroll: null,
+      generation: 1,
+    },
+    search: { query: search },
+  }
+  const d = direct(state, { ui, fs })
+  const draw = () => d.hooks['ui.render'](d.$, { surface: 'terminal', component: 'Pane', requestId: 'filetree', props: pane() }, async () => null)
+  return { ...d, focuses, draw }
+}
+
+describe('where the focus goes (spec-06 R1.2, R4.2, R4.3), through the hooks', () => {
+  test('nav-s and the s key from the rows focus the Input; s moves nothing', async () => {
+    const { hooks, $, state, focuses, draw } = focusWorld('')
+    await findKey(await draw(), 'nav-s').props.onPress()
+    expect(focuses).toEqual(['q'])
+    await hooks['ui.message']($, { element: 'rows', requestId: 'filetree', surface: 'terminal', data: { kind: 'key', key: 's' } }, async () => ({}))
+    expect(focuses).toEqual(['q', 'q'])
+    expect((state.tree as any).cursor).toBe('')
+  })
+
+  test('Enter with a result: the cursor on it, its folder open, the text empty, the focus on open', async () => {
+    const { state, focuses, draw } = focusWorld('a.ts')
+    await findKey(await draw(), 'q').props.onSubmit('a.ts')
+    expect((state.tree as any).cursor).toBe('/p/src/a.ts')
+    expect((state.tree as any).expanded).toEqual(['/p/src'])
+    expect((state.search as any).query).toBe('')
+    expect(focuses).toEqual(['nav-o'])
+  })
+
+  test('Enter with no result empties the text and focuses open; with no term the focus stays', async () => {
+    const { state, focuses, draw } = focusWorld('zzz')
+    await findKey(await draw(), 'q').props.onSubmit('zzz')
+    expect((state.tree as any).cursor).toBe('')
+    expect((state.search as any).query).toBe('')
+    expect(focuses).toEqual(['nav-o'])
+    await findKey(await draw(), 'q').props.onSubmit('')
+    expect(focuses).toEqual(['nav-o'])
   })
 })
