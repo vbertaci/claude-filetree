@@ -12,7 +12,7 @@ const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'bas
 
 export type Row = { id: string; depth: number; node: FileNode; isOpen: boolean }
 
-export type Effect = { load: string } | { copy: 'relative' | 'absolute'; id: string }
+export type Effect = { load: string } | { copy: 'relative' | 'absolute'; id: string } | { open: string }
 
 export type KeyInput = { key: string; shift?: boolean }
 
@@ -163,7 +163,9 @@ export function navigate(t: TreeState, rows: readonly Row[], input: KeyInput): {
     return parent === t.root ? { tree: base } : { tree: { ...base, cursor: parent } }
   }
   if (key === 'return' || key === 'space' || key === ' ') {
-    return row.node.kind === 'dir' ? toggle(base, row.id) : { tree: { ...base, selected: row.id } }
+    if (row.node.kind === 'dir') return toggle(base, row.id)
+    // Enter opens what it selects; space only selects (spec-08 R2.2).
+    return { tree: { ...base, selected: row.id }, ...(key === 'return' ? { effect: { open: row.id } } : {}) }
   }
   return { tree: t }
 }

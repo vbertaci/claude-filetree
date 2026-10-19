@@ -13,7 +13,7 @@ import type {
   ToolCallResult,
 } from 'claude-code'
 
-import type { ActivityState, ExpansionMemory, GitChip, GitState, RowsMessage, SearchState, Tone } from '../types'
+import type { ActivityState, ExpansionMemory, FileNode, GitChip, GitState, PreviewState, RowsMessage, SearchState, Tone } from '../types'
 import {
   FLASH_MS,
   SCAN_LIT_LIMIT,
@@ -57,11 +57,26 @@ import {
   rollUp,
   sameRepo,
 } from './git'
-import { AGE_TICK_MS, type ColumnMode, SIZE_JOBS, SIZE_LIMIT, columnOf, emptyColumns, modeOf, timeModeOf } from './columns'
+import { AGE_TICK_MS, type ColumnMode, SIZE_JOBS, SIZE_LIMIT, columnOf, emptyColumns, formatSize, modeOf, timeModeOf } from './columns'
 import { type GlyphOption, glyphOptionOf, glyphSetOf, hasNerdFont } from './icons'
-import { type Paths, detectHome, detectPlatform, executable, fontDirs, paths as makePaths } from './os'
-import { HEADER_IDS, type HeaderId, layoutPane, renderPane, rootLabel } from './pane'
+import {
+  type EditScheme,
+  type OpenMode,
+  OPEN_TIMEOUT_MS,
+  PREVIEW_MAX_BYTES,
+  clampTop,
+  editSchemeOf,
+  editorUri,
+  isBinary,
+  openModeOf,
+  prepare,
+  refusal,
+  scrollBy,
+} from './open'
+import { type Paths, detectHome, detectPlatform, executable, explorerPath, fontDirs, paths as makePaths } from './os'
+import { HEADER_IDS, type HeaderId, layoutPane, previewRowsOf, renderPane, renderPreview, rootLabel } from './pane'
 import { JUMP_LIMIT, PRUNE, REVEAL_LIMIT, WALK_DEPTH, WALK_LIMIT, filterOf, matches, parseFiles, termOf } from './search'
+import { type SelectionMode, appended, mentionOf, referenceOf, selectionOf } from './selection'
 import {
   type Effect,
   type KeyInput,
@@ -91,6 +106,7 @@ const gitAtom = atom({ plugin: 'filetree-local', key: 'git' }, emptyGit())
 const chipAtom = atom({ plugin: 'filetree-local', key: 'chip' }, null as GitChip | null)
 const searchAtom = atom({ plugin: 'filetree-local', key: 'search' }, { query: '' } as SearchState)
 const columnsAtom = atom({ plugin: 'filetree-local', key: 'columns' }, emptyColumns())
+const previewAtom = atom({ plugin: 'filetree-local', key: 'preview' }, { id: '', top: 0 } as PreviewState)
 
 /** What a shell call's scan compares against, taken before the call runs (R6.1). */
 type Snapshot = { since: number; generation: number; dirs: string[]; names: Map<string, Set<string>>; git: GitState }
@@ -135,6 +151,15 @@ let sizeQueue: string[] = []
 const sizing = new Set<string>()
 let sizeEpoch = 0
 let sizeActive = 0
+let openMode: OpenMode = 'app'
+let editScheme: EditScheme = 'off'
+let selection: SelectionMode = 'mention'
+/** The preview's text, kept out of $.state; null until read, and again after a reload (spec-08 R4.6). */
+let previewed: { id: string; lines: string[]; note: string } | null = null
+/** The id whose text the render asked for and is being read, so a redraw does not ask again. */
+let previewLoading = ''
+/** Lines of the preview's window in the last drawing, for the page keys (spec-08 R5.3). */
+let previewRows = 20
 
 // A refused call reads "<plugin>: $.fs.list: EACCES: ..."; the person needs only the reason.
 const message = (err: unknown): string => (err instanceof Error ? err.message : String(err)).replace(/^[\w-]+: \$\.[\w.]+: /, '')
@@ -386,6 +411,150 @@ async function detectNerdFont($: EngineInterface): Promise<boolean> {
   return false
 }
 
+/** The only $.process.run besides git: explorer.exe by its absolute path, one argument, its exit code ignored (spec-08 R3.1, R3.2, G1). */
+async function launch($: EngineInterface, explorer: string, target: string, shown: string) {
+  try {
+    await $.process.run([explorer, target], { timeoutMs: OPEN_TIMEOUT_MS })
+  } catch (err) {
+    $.ui.toast(`could not open ${shown}: ${message(err)}`)
+  }
+}
+
+/** The default app, past every refusal; a link is judged by where it lands as well (spec-08 R3). */
+async function openInApp($: EngineInterface, id: string) {
+  const explorer = await explorerPath($, paths)
+  if (explorer === null) return void $.ui.toast('opening files needs Windows')
+  const shown = paths.pretty(id, home)
+  const named = refusal(paths, id, home)
+  if (named !== null) return void $.ui.toast(named)
+  let st: FsStat
+  try {
+    st = await $.fs.stat(paths.native(id), { resolve: true })
+  } catch (err) {
+    return void $.ui.toast(`could not open ${shown}: ${message(err)}`)
+  }
+  const name = paths.base(id)
+  if (st.isLink) {
+    if (st.realPath === undefined) return void $.ui.toast(`not opened: ${name} leads nowhere`)
+    if (st.kind === 'dir') return void $.ui.toast(`not opened: ${name} is a folder link`)
+    const landed = refusal(paths, id, home, paths.norm(st.realPath))
+    if (landed !== null) return void $.ui.toast(landed)
+  }
+  if (st.kind !== 'file') return void $.ui.toast(`not opened: ${name} is not a file`)
+  await launch($, explorer, paths.native(id), shown)
+}
+
+/** The editor of the `edit` option at a line, through its vscode://-style link (spec-08 R7). */
+async function editInEditor($: EngineInterface, id: string, line: number) {
+  if (editScheme === 'off') return
+  const explorer = await explorerPath($, paths)
+  if (explorer === null) return void $.ui.toast('opening files needs Windows')
+  if (paths.isNetwork(id)) return void $.ui.toast(`network paths are not opened: ${paths.pretty(id, home)}`)
+  await launch($, explorer, editorUri(editScheme, paths, id, line), paths.pretty(id, home))
+}
+
+/**
+ * Prepares the preview's text: read only where the file lands inside where the cwd lands, by that
+ * landing path. The mod's one $.fs.read (spec-08 R4, G2).
+ */
+async function loadPreview($: EngineInterface, id: string): Promise<{ id: string; lines: string[]; note: string }> {
+  const done = (lines: string[], note: string) => {
+    previewed = { id, lines, note }
+    return previewed
+  }
+  try {
+    const at = await cwd($)
+    const root = await $.fs.stat(paths.native(at), { resolve: true })
+    const file = await $.fs.stat(paths.native(id), { resolve: true })
+    if (root.realPath === undefined || file.realPath === undefined || !paths.inside(paths.norm(root.realPath), paths.norm(file.realPath))) {
+      return done([], `outside the project folder (${paths.pretty(at, home)}); ↗ opens it`)
+    }
+    if (file.kind !== 'file') return done([], 'not a file')
+    if (file.size > PREVIEW_MAX_BYTES) return done([], `${formatSize(file.size)}, too large to preview`)
+    const text = await $.fs.read(paths.native(paths.norm(file.realPath)))
+    if (isBinary(text)) return done([], `binary file, ${formatSize(file.size)}`)
+    const { lines, note } = prepare(text)
+    return done(lines, note)
+  } catch (err) {
+    return done([], `could not read: ${message(err)}`)
+  }
+}
+
+async function showPreview($: EngineInterface, id: string) {
+  await loadPreview($, id)
+  await update($, previewAtom, () => ({ id, top: 0 }))
+  await $.ui.focus({ requestId: PANE, key: editScheme !== 'off' ? 'edit' : 'back' }).catch(() => undefined)
+}
+
+/** Back to the tree, the cursor where it was (spec-08 R6.4). */
+async function closePreview($: EngineInterface) {
+  previewed = null
+  await update($, previewAtom, () => ({ id: '', top: 0 }))
+  await $.ui.focus({ requestId: PANE, key: 'nav-o' }).catch(() => undefined)
+}
+
+/** Moves the window; `to` answers null for no move (spec-08 R6.1–R6.3). */
+async function movePreview($: EngineInterface, to: (top: number, total: number, rows: number) => number | null) {
+  const total = previewed?.lines.length ?? 0
+  await update($, previewAtom, p => {
+    if (p.id === '') return p
+    const top = to(p.top, total, previewRows)
+    return top === null || top === p.top ? p : { ...p, top }
+  })
+}
+
+/** A key the rows Client posted while the preview shows (spec-08 R6.1). */
+async function previewKey($: EngineInterface, key: string) {
+  if (key === 'left' || key === 'h') return closePreview($)
+  if (key === 'e') {
+    const p = await read($, previewAtom)
+    return editInEditor($, p.id, p.top + 1)
+  }
+  return movePreview($, (top, total, rows) => scrollBy(key, top, total, rows))
+}
+
+/** Reads the previewed file again, the window kept inside the new text (spec-08 R6.5). */
+async function reloadPreview($: EngineInterface) {
+  const { id } = await read($, previewAtom)
+  if (id === '') return
+  previewed = null
+  const total = (await loadPreview($, id)).lines.length
+  await update($, previewAtom, p => (p.id === id ? { ...p, top: clampTop(p.top, total, previewRows) } : p))
+  $.ui.invalidate('ui.render')
+}
+
+/** What opening a node does: always the cursor and the selection, then the `open` option (spec-08 R2). */
+async function openNode($: EngineInterface, node: FileNode) {
+  await update($, treeAtom, cur => ({ ...cur, cursor: node.id, selected: node.id }))
+  if (node.kind === 'other' || node.kind === 'dir' || openMode === 'select') return
+  if (openMode === 'preview') return showPreview($, node.id)
+  return openInApp($, node.id)
+}
+
+/** Puts the node's @mention in the prompt box, where the person sees it before sending (spec-09 R2). */
+async function mention($: EngineInterface, id: string) {
+  const text = mentionOf(referenceOf(paths, await cwd($), id))
+  const filled = await $.prompt.fill({ text: `${text} `, mode: 'insert' }).then(
+    r => r.isFilled,
+    () => false,
+  )
+  if (!filled) $.ui.toast(`could not put ${text} in the prompt box`)
+}
+
+/** A file the person mentioned: the folders to it listed and opened, the cursor on it; no glow (spec-09 R4.2, R4.4). */
+async function revealMention($: EngineInterface, id: string) {
+  const { root, generation } = await read($, treeAtom)
+  if (!paths.inside(root, id) || paths.same(root, id)) return
+  if (!(await uncover($, id, generation, false, new Set()))) return
+  await update($, treeAtom, t => {
+    const node = t.generation === generation ? t.nodes.find(n => paths.same(n.id, id)) : undefined
+    if (!node) return t
+    const open = new Set(t.expanded)
+    for (const dir of ancestorsOf(paths, t.root, node.id)) open.add(dir)
+    return { ...t, expanded: [...open], cursor: node.id, scroll: null }
+  })
+}
+
 /** What each header button does; its Client posts the press (spec-07 R5.3). */
 async function headerAction($: EngineInterface, id: HeaderId) {
   switch (id) {
@@ -398,7 +567,8 @@ async function headerAction($: EngineInterface, id: HeaderId) {
       return reroot($, await cwd($), { follow: true, open: false })
     case 'refresh':
       await clearSizes($)
-      return refresh($)
+      await refresh($)
+      return reloadPreview($)
     case 'hidden':
       return update($, treeAtom, cur => toggleHidden(paths, cur))
     case 'size':
@@ -410,11 +580,16 @@ async function headerAction($: EngineInterface, id: HeaderId) {
   }
 }
 
-type ButtonMessage = { id: HeaderId; over: boolean } | { id: HeaderId; press: true }
+type ButtonId = HeaderId | 'external'
+type ButtonMessage = { id: ButtonId; over: boolean } | { id: ButtonId; press: true }
 
-/** Shape check of what a header button posted: only `{ over }` or `{ press: true }`, from a known button (spec-07 R5.5). */
-function parseButton(element: string, data: unknown): ButtonMessage | undefined {
-  const id = HEADER_IDS.find(h => element === `button-${h}`)
+/**
+ * Shape check of what a header button posted: only `{ over }` or `{ press: true }`, from a known
+ * button; the preview's ↗ only while the preview shows (spec-07 R5.5, spec-08 R5.4).
+ */
+function parseButton(element: string, data: unknown, previewing: boolean): ButtonMessage | undefined {
+  const ids: readonly ButtonId[] = previewing ? ['external'] : HEADER_IDS
+  const id = ids.find(h => element === `button-${h}`)
   if (id === undefined || typeof data !== 'object' || data === null || Array.isArray(data)) return undefined
   const m = data as Record<string, unknown>
   if (Object.keys(m).length !== 1) return undefined
@@ -738,6 +913,9 @@ async function observe($: EngineInterface, e: ToolCallInput, result: ToolCallRes
     dropIndex()
     await clearSizes($)
     void refreshGit($).catch(() => undefined)
+    // A preview of a file Claude wrote shows the new text (spec-08 R6.5).
+    const { id } = await read($, previewAtom)
+    if (id !== '' && touch.ids.some(w => paths.same(w, id))) await reloadPreview($)
   } else if (before) {
     await shellActivity($, before, result)
     dropIndex()
@@ -761,6 +939,9 @@ async function reroot($: EngineInterface, root: string, opts: { follow: boolean;
   await update($, treeAtom, t => ({ ...emptyTree(root, t.showHidden), follow: opts.follow, generation: t.generation + 1, expanded }))
   dropIndex()
   await clearSizes($, true)
+  // A new root closes the preview (spec-08 R6.5).
+  previewed = null
+  await update($, previewAtom, p => (p.id === '' ? p : { id: '', top: 0 }))
   await showPane($, opts)
   await loadInDepthOrder($, expanded)
   await refreshGit($)
@@ -793,7 +974,10 @@ async function copyPath($: EngineInterface, id: string, mode: 'relative' | 'abso
 async function apply($: EngineInterface, effect: Effect | undefined, surface: RenderSurface) {
   if (!effect) return
   if ('load' in effect) await listDir($, effect.load)
-  else await copyPath($, effect.id, effect.copy, surface)
+  else if ('open' in effect) {
+    const node = (await read($, treeAtom)).nodes.find(n => n.id === effect.open)
+    if (node) await openNode($, node)
+  } else await copyPath($, effect.id, effect.copy, surface)
 }
 
 async function key($: EngineInterface, input: KeyInput, surface: RenderSurface) {
@@ -819,6 +1003,8 @@ async function press($: EngineInterface, msg: Extract<RowsMessage, { kind: 'pres
   lastPress = isDouble ? null : { id: node.id, at: now }
   if (node.kind === 'dir' && (isDouble || msg.ctrl || msg.shift)) return reroot($, node.id, { follow: false, open: false })
   if (node.kind !== 'dir') {
+    // A double press or a ctrl/shift press opens; a single press selects (spec-08 R2.3).
+    if (isDouble || msg.ctrl || msg.shift) return openNode($, node)
     await update($, treeAtom, cur => ({ ...cur, cursor: node.id, selected: node.id }))
     return
   }
@@ -882,6 +1068,9 @@ export const register: Register = (on, options) => {
   refreshMs = refreshMsOf(options)
   column = columnOf(options)
   glyphOption = glyphOptionOf(options)
+  openMode = openModeOf(options)
+  editScheme = editSchemeOf(options)
+  selection = selectionOf(options)
 
   on('session.start', async ($, e, next) => {
     paths = makePaths(await detectPlatform($))
@@ -958,6 +1147,33 @@ export const register: Register = (on, options) => {
       return <Box />
     }
     const t = await read($, treeAtom)
+    const pv = await read($, previewAtom)
+    if (pv.id !== '') {
+      // The text lives outside the state: after a reload it is read again, never waited for here (spec-08 R4.6).
+      const ready = previewed !== null && previewed.id === pv.id ? previewed : null
+      if (ready === null && previewLoading !== pv.id) {
+        previewLoading = pv.id
+        void loadPreview($, pv.id)
+          .then(() => $.ui.invalidate('ui.render'))
+          .catch(() => undefined)
+          .finally(() => {
+            if (previewLoading === pv.id) previewLoading = ''
+          })
+      }
+      previewRows = previewRowsOf(e.surface, e.props.scroll.bodyRows, ready?.note ?? '', ready?.lines.length ?? 0)
+      const name = paths.inside(t.root, pv.id) && !paths.same(t.root, pv.id) ? paths.native(paths.relative(t.root, pv.id)) : paths.pretty(pv.id, home)
+      const view = { id: pv.id, name, top: pv.top, rows: previewRows, lines: ready?.lines ?? null, note: ready?.note ?? '' }
+      const glyphs = glyphSetOf(glyphOption, nerdFont, e.surface)
+      const focusBack = () => $.ui.focus({ requestId: PANE, key: editScheme !== 'off' ? 'edit' : 'back' }).catch(() => undefined)
+      return renderPreview($, e, view, { glyphs, hovered, edit: editScheme !== 'off' }, {
+        back: () => closePreview($),
+        scroll: k => previewKey($, k).then(focusBack),
+        edit: async () => {
+          const p = await read($, previewAtom)
+          await editInEditor($, p.id, p.top + 1)
+        },
+      })
+    }
     const activity = await read($, activityAtom)
     const now = await $.clock.now()
     const glow = isLive(activity, t.root, now) ? { lit: activity.lit, focus: settings.follow ? activity.focus : null } : null
@@ -977,21 +1193,29 @@ export const register: Register = (on, options) => {
     // The focus goes back to `open` after a nav button; a ring that cannot move is no failure.
     const nav = (k: KeyInput['key']) =>
       key($, { key: k }, e.surface).then(() => $.ui.focus({ requestId: PANE, key: 'nav-o' }).catch(() => undefined))
-    return renderPane($, e, paths, t, layout, git, glow, chip, query, { glyphs, mode, timeMode: timeModeOf(column), hovered }, {
+    const header = { glyphs, mode, timeMode: timeModeOf(column), hovered, mention: selection !== 'off' }
+    return renderPane($, e, paths, t, layout, git, glow, chip, query, header, {
       nav,
       search: value => search($, value),
       jump: value => jump($, value),
       clear: () => update($, searchAtom, () => ({ query: '' })),
       focusSearch: () => focusSearch($),
+      mention: async () => {
+        const { selected } = await read($, treeAtom)
+        if (selected !== '') await mention($, selected)
+      },
     })
   })
 
   on('ui.message', { requestId: PANE }, async ($, e, next) => {
+    const pv = await read($, previewAtom)
     if (typeof e.element === 'string' && e.element.startsWith('button-')) {
-      const msg = parseButton(e.element, e.data)
+      const msg = parseButton(e.element, e.data, pv.id !== '')
       if (!msg) return {}
-      if ('press' in msg) await headerAction($, msg.id)
-      else {
+      if ('press' in msg) {
+        if (msg.id === 'external') await openInApp($, pv.id)
+        else await headerAction($, msg.id)
+      } else {
         const was = hovered
         hovered = msg.over ? msg.id : hovered === msg.id ? '' : hovered
         if (hovered !== was) $.ui.invalidate('ui.render')
@@ -1002,7 +1226,14 @@ export const register: Register = (on, options) => {
     const t = await read($, treeAtom)
     const msg = parseMessage(e.data, new Set(t.nodes.map(n => n.id)))
     if (!msg) return {}
-    if (msg.kind === 'key' && msg.key === 's') await focusSearch($)
+    // While the preview shows, only its keys count; presses and the scrollbar have no rows to act on (spec-08 R6.1).
+    if (pv.id !== '') {
+      if (msg.kind === 'key') await previewKey($, msg.key)
+      return {}
+    }
+    if (msg.kind === 'key' && msg.key === 'a' && !msg.ctrl) {
+      if (selection !== 'off' && t.cursor !== '') await mention($, t.cursor)
+    } else if (msg.kind === 'key' && msg.key === 's') await focusSearch($)
     else if (msg.kind === 'key') await key($, msg, e.surface)
     else if (msg.kind === 'press') await press($, msg, e.surface)
     else await update($, treeAtom, cur => ({ ...cur, scroll: Math.round(msg.fraction * view.max) }))
@@ -1012,9 +1243,39 @@ export const register: Register = (on, options) => {
   on('ui.scroll', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     if (lastSurface !== 'terminal') return next(e)
     const step = Math.sign(e.by) * Math.max(3, Math.abs(e.by))
+    // The wheel scrolls the preview while it shows (spec-08 R6.3).
+    if ((await read($, previewAtom)).id !== '') {
+      await movePreview($, (top, total, rows) => clampTop(top + step, total, rows))
+      return {}
+    }
     const scroll = Math.max(0, Math.min(view.max, view.from + step))
     await update($, treeAtom, t => ({ ...t, scroll }))
     return {}
+  })
+
+  // The selection reaches Claude only in plain sight: a line at the end of the prompt the person sees
+  // in the transcript, never `e.context` (spec-09 R3, G1).
+  on('prompt.submit', async ($, e, next) => {
+    if (selection !== 'append' || e.origin.kind !== 'composer' || e.command !== undefined || e.isMeta) return next(e)
+    const { selected } = await read($, treeAtom)
+    if (selected === '') return next(e)
+    const isFile = await $.fs.stat(paths.native(selected)).then(
+      s => s.kind === 'file',
+      () => false,
+    )
+    if (!isFile) return next(e)
+    const text = appended(e.text, referenceOf(paths, await cwd($), selected))
+    return next(text === null ? e : { ...e, text })
+  })
+
+  // Reveals what the person mentioned once the engine has read it; the event and its result pass untouched (spec-09 R4, G2).
+  on('prompt.mention', async ($, e, next) => {
+    const result = await next(e)
+    if (result.type != null && e.agentId === undefined) {
+      const id = paths.norm(e.path)
+      queue = queue.then(() => revealMention($, id)).catch(() => undefined)
+    }
+    return result
   })
 
   on('ui.focus', { component: 'Pane', requestId: PANE }, async ($, e, next) => {

@@ -169,7 +169,7 @@ Voltar para uma pasta deve restaurar as pastas que estavam abertas nela durante 
 - R9.1. Quando o Client enviar `{ kind: 'key' }`, o mod deve aplicar a tabela [Teclas](#teclas) e ignorar as teclas que não estão nela.
 - R9.2. Quando o Client enviar um `press` esquerdo sem modificador numa pasta, o mod deve mover o cursor para ela e alternar a expansão.
 - R9.3. Quando o Client enviar um `press` esquerdo sem modificador num nó que não é pasta, o mod deve mover o cursor e marcar o nó como `selected`.
-- R9.4. Quando dois `press` esquerdos no mesmo id chegarem com até 450 ms de intervalo, num nó `dir`, o mod deve re-enraizar nele com `follow = false`. Num nó que não é pasta, deve se comportar como R9.3. A abertura de arquivos é da spec-08.
+- R9.4. Quando dois `press` esquerdos no mesmo id chegarem com até 450 ms de intervalo, num nó `dir`, o mod deve re-enraizar nele com `follow = false`. Num nó que não é pasta, deve se comportar como R9.3 e, desde a spec-08 (R2.3), abrir o arquivo.
 - R9.5. Quando chegar um `press` esquerdo com `ctrl` ou `shift` numa pasta, o mod deve re-enraizar nela com `follow = false`.
 - R9.6. Quando chegar um `press` direito, o mod deve copiar o caminho relativo à raiz, na forma nativa, com `$.ui.copy`, e mostrar o toast `Copied <caminho>`. Com `shift`, deve copiar o caminho absoluto nativo.
 - R9.7. Se `$.ui.copy` falhar, o mod deve mostrar o toast `Could not copy the path`.
@@ -366,7 +366,8 @@ Chaves de `ClientKeyEvent.key`. A coluna "Original" indica paridade.
 | `home` / `end` | primeira / última linha | igual |
 | `right`, `l` | expande uma pasta fechada; noutro caso, nada | igual |
 | `left`, `h` | recolhe uma pasta aberta; noutro caso, cursor para a pasta-mãe, exceto quando a mãe é a raiz | igual |
-| `return`, `space` | pasta: alterna; outro nó: marca `selected` | arquivo: abre (spec-08); `space`: Quick Look no macOS |
+| `return`, `space` | pasta: alterna; outro nó: marca `selected`. Desde a spec-08 (R2.2), `return` num nó que não é pasta também abre | arquivo: abre; `space`: Quick Look no macOS |
+| `a` | desde a spec-09 (R2.1): põe a menção do nó do cursor na caixa do prompt | não existe |
 | `y` | copia o caminho relativo | igual |
 | `Y`, ou `y` com `shift` | copia o caminho absoluto | igual |
 
@@ -678,7 +679,7 @@ Verificação manual, numa sessão real com o mod carregado via `CLAUDE_CODE_PLU
 - Atualização automática por mudanças de fora da sessão: spec-05.
 - Busca: spec-06.
 - Tamanhos, idade, glyphs Nerd Font e dicas de hover nos botões: spec-07.
-- Abrir arquivo, preview e edição: spec-08. Aqui, duplo clique e `return` em arquivo só selecionam.
-- Contexto da seleção no prompt e `@menções`: spec-09.
+- Abrir arquivo, preview e edição: spec-08, que emenda R9.4 e a tecla `return`.
+- Contexto da seleção no prompt e `@menções`: spec-09, que acrescenta a tecla `a` e o botão `@` do rodapé.
 - Realce da linha sob o mouse (hover): fica para a spec-07, junto das dicas de hover.
 - Persistir a memória de expansão entre sessões (adiado).

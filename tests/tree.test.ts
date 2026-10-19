@@ -146,6 +146,14 @@ describe('navigate (keys table)', () => {
     expect(move(at(sample(), 'C:/p/src/a.ts'), ' ').tree.selected).toBe('C:/p/src/a.ts')
   })
 
+  test('return on a file also opens it; space only selects (spec-08 R2.2)', () => {
+    const enter = move(at(sample(), 'C:/p/src/a.ts'), 'return')
+    expect(enter.tree.selected).toBe('C:/p/src/a.ts')
+    expect(enter.effect).toEqual({ open: 'C:/p/src/a.ts' })
+    expect(move(at(sample(), 'C:/p/src/a.ts'), 'space').effect).toBe(undefined)
+    expect(move(at(sample(), 'C:/p/src/lib'), 'return').effect).toEqual({ load: 'C:/p/src/lib' })
+  })
+
   test('y and Y copy', () => {
     const t = at(sample(), 'C:/p/src/a.ts')
     expect(move(t, 'y').effect).toEqual({ copy: 'relative', id: 'C:/p/src/a.ts' })

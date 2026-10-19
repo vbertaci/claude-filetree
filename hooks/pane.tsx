@@ -2,6 +2,7 @@ import type { EngineInterface, RenderElement, RenderInput } from 'claude-code'
 
 import type { ButtonProps, GitChip, GitLetter, GitState, Glow, RowSpec, RowsProps, Seg, ThemeKeyName, Tone, TreeState } from '../types'
 import { type ColumnMode, cellText, widthOf } from './columns'
+import { isMarkdown, windowLines } from './open'
 import { BRANCH_ID, type NodeGit, gitOf } from './git'
 import { type GlyphSet, LABELS, caret, chipIcon, cols, nodeGlyph, take } from './icons'
 import type { Paths } from './os'
@@ -45,8 +46,8 @@ export type Layout = {
   sizeWanted: string[]
 }
 
-/** What the header draws besides the tree: the glyphs, the column, the button under the pointer. */
-export type HeaderLook = { glyphs: GlyphSet; mode: ColumnMode; timeMode: 'date' | 'age'; hovered: string }
+/** What the header draws besides the tree: the glyphs, the column, the button under the pointer, the footer's @ (spec-09 R2.2). */
+export type HeaderLook = { glyphs: GlyphSet; mode: ColumnMode; timeMode: 'date' | 'age'; hovered: string; mention: boolean }
 
 /** Each returns the work it started, so a press settles once that work has. The header buttons post instead. */
 export type PaneActions = {
@@ -55,6 +56,19 @@ export type PaneActions = {
   jump: (value: string) => Promise<unknown>
   clear: () => Promise<unknown>
   focusSearch: () => Promise<unknown>
+  mention: () => Promise<unknown>
+}
+
+/** The preview's file, window and text; `lines` is null while the text is being read (spec-08 R4.6). */
+export type PreviewView = { id: string; name: string; top: number; rows: number; lines: string[] | null; note: string }
+
+/** What the preview's header draws besides the file: the glyphs, the button under the pointer, the edit button. */
+export type PreviewLook = { glyphs: GlyphSet; hovered: string; edit: boolean }
+
+export type PreviewActions = {
+  back: () => Promise<unknown>
+  scroll: (key: 'down' | 'up' | 'pagedown' | 'pageup') => Promise<unknown>
+  edit: () => Promise<unknown>
 }
 
 const LETTER_COLOR: Record<GitLetter, ThemeKeyName> = {
@@ -290,11 +304,71 @@ function headerButtons(t: TreeState, look: HeaderLook): HeaderButton[] {
 }
 
 /** The hovered button's hint, or '' when it would squeeze the title under MIN_TITLE columns (spec-07 R5.4). */
-function hintOf(buttons: readonly HeaderButton[], hovered: string, bodyColumns: number): string {
+function hintOf(buttons: readonly { id: string; label: string; hint: string }[], hovered: string, bodyColumns: number): string {
   const text = buttons.find(b => b.id === hovered)?.hint
   const buttonsWidth = buttons.reduce((n, b) => n + cols(b.label), 0) + Math.max(0, buttons.length - 1)
   const room = bodyColumns - buttonsWidth - MIN_TITLE
   return text !== undefined && cols(text) + 1 <= room ? text : ''
+}
+
+/** The preview's window: the body less its two fixed rows and the note on the terminal, the whole text on the desktop (spec-08 R5.3). */
+export function previewRowsOf(surface: string, bodyRows: number, note: string, total: number): number {
+  return surface === 'terminal' ? Math.max(4, bodyRows - 2 - (note !== '' ? 1 : 0)) : Math.max(1, total)
+}
+
+/** The preview in place of the tree: its header, its scroll buttons, the note and the window (spec-08 R5). */
+export function renderPreview(
+  $: EngineInterface,
+  e: RenderInput<'Pane', 'terminal' | 'desktop'>,
+  view: PreviewView,
+  look: PreviewLook,
+  actions: PreviewActions,
+): RenderElement {
+  const { Box, Text, Button, Client } = $.ui.resolve(e)
+  const L = LABELS[look.glyphs]
+  const external = { id: 'external', label: L.external, hint: 'open in default app' }
+  // The back button takes its columns from the title's room, as a header button does.
+  const hint = hintOf([external], look.hovered, e.props.bodyColumns - cols(L.back) - 1)
+  const markdown = isMarkdown(view.id)
+  const win = view.lines === null ? null : windowLines(view.lines, view.top, view.rows, markdown)
+  const line = (win?.top ?? 0) + 1
+  const props: RowsProps | null =
+    win === null ? null : { rows: [], bar: null, empty: null, more: 0, preview: { text: win.text, path: view.id, startLine: win.top + 1, markdown } }
+
+  return (
+    <Box flexDirection="column">
+      <Box flexDirection="row">
+        <Button key="back" plain hotkey="h" onPress={actions.back}>{L.back}</Button>
+        <Text> </Text>
+        <Box flexGrow={1} flexShrink={1} overflow="hidden">
+          <Text weight="bold" wrap="truncate-start">
+            {view.name}
+          </Text>
+        </Box>
+        {hint !== '' && <Text color="subtle">{`${hint} `}</Text>}
+        <Client key="button-external" module="./button.tsx" props={{ id: 'external', label: L.external, dim: true } satisfies ButtonProps} />
+      </Box>
+      <Box flexDirection="row" gap={2}>
+        <Button key="pv-j" plain dimColor hotkey="j" onPress={() => actions.scroll('down')}>{L['pv-j']}</Button>
+        <Button key="pv-k" plain dimColor hotkey="k" onPress={() => actions.scroll('up')}>{L['pv-k']}</Button>
+        <Button key="pv-f" plain dimColor hotkey="f" onPress={() => actions.scroll('pagedown')}>{L['pv-f']}</Button>
+        <Button key="pv-b" plain dimColor hotkey="b" onPress={() => actions.scroll('pageup')}>{L['pv-b']}</Button>
+        {look.edit && <Button key="edit" plain dimColor hotkey="e" onPress={actions.edit}>{`${L.edit} :${line}`}</Button>}
+      </Box>
+      {view.note !== '' && (
+        <Text color="subtle" wrap="truncate-end">
+          {view.note}
+        </Text>
+      )}
+      {props === null ? (
+        <Text color="subtle">loading…</Text>
+      ) : e.surface === 'terminal' ? (
+        <Client key="rows" module="./rows.tsx" props={props} height={Math.max(1, view.rows)} />
+      ) : (
+        <Client key="rows" module="./rows.tsx" props={props} />
+      )}
+    </Box>
+  )
 }
 
 export function renderPane(
@@ -401,6 +475,12 @@ export function renderPane(
       )}
       {(t.selected !== '' || chip !== null) && (
         <Box flexDirection="row">
+          {/* The selection reaches the prompt box only when the person asks, in plain sight (spec-09 R2.2). */}
+          {t.selected !== '' && look.mention && (
+            <Box flexShrink={0} marginRight={1}>
+              <Button key="mention" plain dimColor onPress={actions.mention}>{L.mention}</Button>
+            </Box>
+          )}
           <Box flexGrow={1} flexShrink={1} overflow="hidden">
             {t.selected !== '' && (
               <Text color="subtle" wrap="truncate-start">

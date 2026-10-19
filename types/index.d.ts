@@ -145,6 +145,15 @@ export type RowsProps = {
   empty: string | null
   /** Rows left out on the desktop. */
   more: number
+  /** The preview's window, drawn instead of the rows (spec-08 R5.2). */
+  preview?: { text: string; path: string; startLine: number; markdown: boolean }
+}
+
+export type PreviewState = {
+  /** Paths.norm of the file previewed; '' when the tree shows (spec-08). */
+  id: string
+  /** First line of the window, from 0. */
+  top: number
 }
 
 /** What pane.tsx hands each header button Client (spec-07 R5.1). */
@@ -165,6 +174,7 @@ declare module 'claude-code' {
       chip: GitChip | null
       search: SearchState
       columns: ColumnsState
+      preview: PreviewState
     }
   }
 }

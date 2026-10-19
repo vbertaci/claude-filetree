@@ -135,7 +135,7 @@ export function paths(platform: Platform): Paths {
 }
 
 /** Executables the mod may run (spec-00 R1.2). Only this module picks by platform. */
-export const EXECUTABLES = { git: { windows: 'git.exe', posix: 'git' } } as const
+export const EXECUTABLES = { git: { windows: 'git.exe', posix: 'git' }, explorer: { windows: 'explorer.exe', posix: '' } } as const
 
 export function executable(name: keyof typeof EXECUTABLES, platform: Platform): string {
   return EXECUTABLES[name][platform]
@@ -149,6 +149,13 @@ export async function detectPlatform($: EngineInterface): Promise<Platform> {
 export async function detectHome($: EngineInterface, p: Paths): Promise<string> {
   const home = p.platform === 'windows' ? await $.env.get('USERPROFILE') : await $.env.get('HOME')
   return home ? p.norm(home) : ''
+}
+
+/** The default-app launcher by its absolute path, never looked up on the PATH; null off Windows or without WINDIR (spec-08 R3.1, R3.3). */
+export async function explorerPath($: EngineInterface, p: Paths): Promise<string | null> {
+  if (p.platform !== 'windows') return null
+  const windir = await $.env.get('WINDIR')
+  return windir ? p.native(p.join(p.norm(windir), executable('explorer', p.platform))) : null
 }
 
 /** Where installed fonts live: on Windows the machine's and the person's folders; none elsewhere (spec-07 R4.2). */

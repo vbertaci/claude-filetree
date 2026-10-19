@@ -1,6 +1,6 @@
 {
   "name": "filetree-local",
-  "version": "0.7.0",
+  "version": "0.9.0",
   "description": "IDE-style file tree pane for Claude Code, local build",
   "author": { "name": "w4rl0ck" },
   "types": "./types/index.d.ts",
@@ -53,6 +53,27 @@
       "description": "auto: Nerd Font icons in the terminal when a Nerd Font is installed on this machine; plain everywhere else. nerd: always Nerd Font icons. plain: Unicode only.",
       "default": "auto",
       "options": ["auto", "nerd", "plain"]
+    },
+    "open": {
+      "type": "string",
+      "title": "Open with",
+      "description": "What a double-click or Enter does with a file. app: the default Windows app (programs and scripts are never run). preview: show it in the pane (← goes back; ↗ opens the default app). select: only select it.",
+      "default": "app",
+      "options": ["app", "preview", "select"]
+    },
+    "edit": {
+      "type": "string",
+      "title": "Edit with",
+      "description": "What e does in the preview: open the file in this editor at the top line shown, through its vscode://-style link. off: the edit button is hidden.",
+      "default": "off",
+      "options": ["off", "vscode", "vscode-insiders", "cursor"]
+    },
+    "selection": {
+      "type": "string",
+      "title": "Selection in prompt",
+      "description": "How Claude learns what you picked in the tree, always in plain sight. mention: a puts @path of the row under the cursor in the prompt box, and @ in the footer does it for the selected file. append: also adds a line (selected in the file tree: path) to the end of each prompt you type while a file is selected. off: neither. @mentions you type reveal the file in the tree either way.",
+      "default": "mention",
+      "options": ["mention", "append", "off"]
     }
   }
 }

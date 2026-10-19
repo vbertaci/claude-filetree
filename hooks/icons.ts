@@ -171,8 +171,16 @@ export type LabelId =
   | 'nav-o'
   | 'nav-s'
   | 'branch'
+  | 'back'
+  | 'external'
+  | 'pv-j'
+  | 'pv-k'
+  | 'pv-f'
+  | 'pv-b'
+  | 'edit'
+  | 'mention'
 
-/** The header, navigation and branch labels of each set (spec-07 Rótulos). */
+/** The header, navigation and branch labels of each set (spec-07 Rótulos), the preview's (spec-08) and the footer's @ (spec-09). */
 export const LABELS: Record<GlyphSet, Record<LabelId, string>> = {
   plain: {
     up: '↑',
@@ -190,6 +198,14 @@ export const LABELS: Record<GlyphSet, Record<LabelId, string>> = {
     'nav-o': 'open',
     'nav-s': '/',
     branch: '⑂',
+    back: '← files',
+    external: '↗',
+    'pv-j': '↓',
+    'pv-k': '↑',
+    'pv-f': 'page ↓',
+    'pv-b': 'page ↑',
+    edit: 'edit',
+    mention: '@',
   },
   nerd: {
     up: cp(0xf005d),
@@ -207,6 +223,14 @@ export const LABELS: Record<GlyphSet, Record<LabelId, string>> = {
     'nav-o': `${cp(0xf03cb)} open`,
     'nav-s': cp(0xf0349),
     branch: cp(0xf418),
+    back: `${cp(0xf004d)} files`,
+    external: cp(0xf08e),
+    'pv-j': cp(0xf0045),
+    'pv-k': cp(0xf005d),
+    'pv-f': `${cp(0xf0045)} page`,
+    'pv-b': `${cp(0xf005d)} page`,
+    edit: `${cp(0xf03eb)} edit`,
+    mention: '@',
   },
 }
 

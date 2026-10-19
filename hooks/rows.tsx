@@ -42,6 +42,7 @@ const Rows: ClientModule<RowsProps, Local> = (props, surface) => {
   const phase = local.phase
   const hover = local.hover
   const onBar = (e: ClientPointerEvent) => props.bar !== null && e.x >= surface.columns - 1
+  const preview = props.preview
 
   surface.onKey(e => post({ kind: 'key', key: e.key, ...(e.ctrl ? { ctrl: true } : {}), ...(e.shift ? { shift: true } : {}) }))
   const hoverAt = (y: number) => {
@@ -49,6 +50,8 @@ const Rows: ClientModule<RowsProps, Local> = (props, surface) => {
     if (now && now.hover !== y) surface.setState({ ...now, hover: y })
   }
   surface.onPointer(e => {
+    // The preview has no rows to press; its keys still post (spec-08 R6.1).
+    if (preview) return
     const scrollTo = () => {
       hoverAt(-1)
       post({ kind: 'scrollTo', fraction: Math.max(0, Math.min(1, e.y / Math.max(1, props.rows.length - 1))) })
@@ -62,6 +65,17 @@ const Rows: ClientModule<RowsProps, Local> = (props, surface) => {
     if (!row) return
     post({ kind: 'press', id: row.id, button: e.button, ...(e.ctrl ? { ctrl: true } : {}), ...(e.shift ? { shift: true } : {}) })
   })
+
+  // The preview draws in this same element, so the keys and the focus stay where they were (spec-08 R5.2).
+  if (preview) {
+    const { Markdown, Code } = surface.elements
+    if (preview.text === '') return <Text> </Text>
+    return preview.markdown ? (
+      <Markdown text={preview.text} />
+    ) : (
+      <Code source={preview.text} path={preview.path} startLine={preview.startLine} wrap="truncate-end" />
+    )
+  }
 
   if (props.empty !== null) return <Text color="subtle">{props.empty}</Text>
 
