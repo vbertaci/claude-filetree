@@ -156,6 +156,19 @@ export type PreviewState = {
   top: number
 }
 
+export type TouchedState = {
+  /** The pane shows these lists in place of the tree (spec-10 R1). */
+  show: boolean
+  /** Files Claude changed, latest first; Paths.norm ids (spec-10 R2). */
+  written: string[]
+  /** Files Claude read and has not changed, latest first. */
+  read: string[]
+  /** Id of a listed file or ''. */
+  cursor: string
+  /** null = automatic window that follows the cursor. */
+  scroll: number | null
+}
+
 /** What pane.tsx hands each header button Client (spec-07 R5.1). */
 export type ButtonProps = { id: string; label: string; dim: boolean }
 
@@ -175,6 +188,7 @@ declare module 'claude-code' {
       search: SearchState
       columns: ColumnsState
       preview: PreviewState
+      touched: TouchedState
     }
   }
 }

@@ -179,8 +179,13 @@ export type LabelId =
   | 'pv-b'
   | 'edit'
   | 'mention'
+  | 'touched'
+  | 'clean'
 
-/** The header, navigation and branch labels of each set (spec-07 Rótulos), the preview's (spec-08) and the footer's @ (spec-09). */
+/**
+ * The header, navigation and branch labels of each set (spec-07 Rótulos), the preview's (spec-08),
+ * the footer's @ (spec-09) and the touched view's (spec-10).
+ */
 export const LABELS: Record<GlyphSet, Record<LabelId, string>> = {
   plain: {
     up: '↑',
@@ -206,6 +211,8 @@ export const LABELS: Record<GlyphSet, Record<LabelId, string>> = {
     'pv-b': 'page ↑',
     edit: 'edit',
     mention: '@',
+    touched: '✎',
+    clean: 'clean',
   },
   nerd: {
     up: cp(0xf005d),
@@ -231,6 +238,8 @@ export const LABELS: Record<GlyphSet, Record<LabelId, string>> = {
     'pv-b': `${cp(0xf005d)} page`,
     edit: `${cp(0xf03eb)} edit`,
     mention: '@',
+    touched: cp(0xea82),
+    clean: `${cp(0xf00e2)} clean`,
   },
 }
 

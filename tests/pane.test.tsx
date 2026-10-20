@@ -2436,8 +2436,8 @@ describe('header hints (spec-07 R5)', () => {
     await ui.post({ over: false }, { in: 'button-refresh' })
     expect((await texts(ui)).some(t => t.startsWith('reload'))).toBe(false)
     await ui.unmount()
-    // 30 columns: six one-column buttons and five gaps leave 11 beside an 8-column title.
-    ui = await mount($, 'terminal', pane(30))
+    // 32 columns: seven one-column buttons and six gaps leave 11 beside an 8-column title.
+    ui = await mount($, 'terminal', pane(32))
     await ui.post({ over: true }, { in: 'button-size' })
     expect(await texts(ui)).toContain('show sizes ')
     await ui.post({ over: true }, { in: 'button-refresh' })

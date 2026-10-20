@@ -7,13 +7,14 @@ import type {
   FsStat,
   ProcessRunResult,
   Register,
+  RenderInput,
   RenderSurface,
   Timer,
   ToolCallInput,
   ToolCallResult,
 } from 'claude-code'
 
-import type { ActivityState, ExpansionMemory, FileNode, GitChip, GitState, PreviewState, RowsMessage, SearchState, Tone } from '../types'
+import type { ActivityState, ExpansionMemory, FileNode, GitChip, GitState, PreviewState, RowsMessage, SearchState, Tone, TouchedState } from '../types'
 import {
   FLASH_MS,
   SCAN_LIT_LIMIT,
@@ -74,9 +75,23 @@ import {
   scrollBy,
 } from './open'
 import { type Paths, detectHome, detectPlatform, executable, explorerPath, fontDirs, paths as makePaths } from './os'
-import { HEADER_IDS, type HeaderId, layoutPane, previewRowsOf, renderPane, renderPreview, rootLabel } from './pane'
+import {
+  type GlowView,
+  HEADER_IDS,
+  type HeaderId,
+  TOUCHED_IDS,
+  type TouchedId,
+  layoutPane,
+  layoutTouched,
+  previewRowsOf,
+  renderPane,
+  renderPreview,
+  renderTouched,
+  rootLabel,
+} from './pane'
 import { JUMP_LIMIT, PRUNE, REVEAL_LIMIT, WALK_DEPTH, WALK_LIMIT, filterOf, matches, parseFiles, termOf } from './search'
 import { type SelectionMode, appended, mentionOf, referenceOf, selectionOf } from './selection'
+import { type TouchedEffect, clean, countsAsRead, emptyTouched, forget, listedIds, navigateTouched, record } from './touched'
 import {
   type Effect,
   type KeyInput,
@@ -107,6 +122,7 @@ const chipAtom = atom({ plugin: 'filetree-local', key: 'chip' }, null as GitChip
 const searchAtom = atom({ plugin: 'filetree-local', key: 'search' }, { query: '' } as SearchState)
 const columnsAtom = atom({ plugin: 'filetree-local', key: 'columns' }, emptyColumns())
 const previewAtom = atom({ plugin: 'filetree-local', key: 'preview' }, { id: '', top: 0 } as PreviewState)
+const touchedAtom = atom({ plugin: 'filetree-local', key: 'touched' }, emptyTouched() as TouchedState)
 
 /** What a shell call's scan compares against, taken before the call runs (R6.1). */
 type Snapshot = { since: number; generation: number; dirs: string[]; names: Map<string, Set<string>>; git: GitState }
@@ -120,6 +136,8 @@ let listSeq = 0
 const listLatest = new Map<string, number>()
 const unreadableToasted = new Set<string>()
 let view = { from: 0, max: 0 }
+/** The touched view's window in the last drawing (spec-10 R3.4). */
+let touchedView = { from: 0, max: 0 }
 let lastSurface: RenderSurface | undefined
 let settings: Settings = { reads: true, writes: true, follow: true }
 let glowTimer: Timer | null = null
@@ -555,9 +573,86 @@ async function revealMention($: EngineInterface, id: string) {
   })
 }
 
+/** The files Claude touched, from a tool call: inside the cwd or the tree's root (spec-10 R2.1). */
+async function noteTool($: EngineInterface, e: ToolCallInput, result: ToolCallResult, at: string, root: string) {
+  if (e.tool === 'Bash' || e.tool === 'PowerShell') return
+  const ids: string[] = []
+  let kind: 'read' | 'write' | null = null
+  for (const within of root === '' || paths.same(at, root) ? [at] : [at, root]) {
+    const touch = touchOf(e, result, { paths, cwd: at, home, root: within })
+    if (touch === null || touch.kind === 'scan') continue
+    kind = touch.kind
+    ids.push(...touch.ids)
+  }
+  if (kind === null || (kind === 'read' && !countsAsRead(e.tool))) return
+  await noteFiles($, kind, ids)
+}
+
+async function noteFiles($: EngineInterface, kind: 'read' | 'write', ids: readonly string[]) {
+  if (ids.length > 0) await update($, touchedAtom, s => record(s, paths, kind, ids))
+}
+
+/** The touched view in place of the tree, or the tree back; the preview closes (spec-10 R1.3). */
+async function toggleTouched($: EngineInterface) {
+  if ((await read($, previewAtom)).id !== '') {
+    previewed = null
+    await update($, previewAtom, () => ({ id: '', top: 0 }))
+  }
+  await update($, touchedAtom, s => ({ ...s, show: !s.show, scroll: null }))
+}
+
+/** A listed file leaves its list and becomes the selection; Enter and a ctrl or shift press then open it (spec-10 R4). */
+async function takeTouched($: EngineInterface, id: string, open: boolean) {
+  await update($, touchedAtom, s => forget(s, paths, id))
+  await update($, treeAtom, t => ({ ...t, selected: id }))
+  if (!open || openMode === 'select') return
+  if (openMode === 'preview') return showPreview($, id)
+  return openInApp($, id)
+}
+
+async function applyTouched($: EngineInterface, effect: TouchedEffect | undefined, surface: RenderSurface) {
+  if (!effect) return
+  if ('open' in effect) await takeTouched($, effect.open, true)
+  else await copyPath($, effect.id, effect.copy, surface)
+}
+
+async function touchedKey($: EngineInterface, input: KeyInput, surface: RenderSurface) {
+  let effect: TouchedEffect | undefined
+  await update($, touchedAtom, s => {
+    const r = navigateTouched(s, input)
+    effect = r.effect
+    return r.touched
+  })
+  await applyTouched($, effect, surface)
+}
+
+/** What the rows Client posted while the touched view shows (spec-10 R4). */
+async function touchedMessage($: EngineInterface, msg: RowsMessage, surface: RenderSurface) {
+  if (msg.kind === 'scrollTo') {
+    await update($, touchedAtom, s => ({ ...s, scroll: Math.round(msg.fraction * touchedView.max) }))
+    return
+  }
+  if (msg.kind === 'key') {
+    if (msg.key === 't' && !msg.ctrl) return toggleTouched($)
+    if (msg.key === 'a' && !msg.ctrl) {
+      const { cursor } = await read($, touchedAtom)
+      if (selection !== 'off' && cursor !== '') await mention($, cursor)
+      return
+    }
+    return touchedKey($, msg, surface)
+  }
+  await update($, touchedAtom, s => ({ ...s, scroll: touchedView.from }))
+  if (msg.button === 'right') return copyPath($, msg.id, msg.shift ? 'absolute' : 'relative', surface)
+  return takeTouched($, msg.id, Boolean(msg.ctrl || msg.shift))
+}
+
 /** What each header button does; its Client posts the press (spec-07 R5.3). */
-async function headerAction($: EngineInterface, id: HeaderId) {
+async function headerAction($: EngineInterface, id: HeaderId | TouchedId) {
   switch (id) {
+    case 'touched':
+      return toggleTouched($)
+    case 'clean':
+      return update($, touchedAtom, clean)
     case 'up': {
       const up = paths.parent((await read($, treeAtom)).root)
       if (up !== null) await reroot($, up, { follow: false, open: false })
@@ -580,15 +675,16 @@ async function headerAction($: EngineInterface, id: HeaderId) {
   }
 }
 
-type ButtonId = HeaderId | 'external'
+type ButtonId = HeaderId | TouchedId | 'external'
 type ButtonMessage = { id: ButtonId; over: boolean } | { id: ButtonId; press: true }
 
 /**
  * Shape check of what a header button posted: only `{ over }` or `{ press: true }`, from a known
- * button; the preview's ↗ only while the preview shows (spec-07 R5.5, spec-08 R5.4).
+ * button; the preview's ↗ only while the preview shows, clean only in the touched view (spec-07 R5.5,
+ * spec-08 R5.4, spec-10 R5.1).
  */
-function parseButton(element: string, data: unknown, previewing: boolean): ButtonMessage | undefined {
-  const ids: readonly ButtonId[] = previewing ? ['external'] : HEADER_IDS
+function parseButton(element: string, data: unknown, previewing: boolean, touching: boolean): ButtonMessage | undefined {
+  const ids: readonly ButtonId[] = previewing ? ['external'] : touching ? TOUCHED_IDS : HEADER_IDS
   const id = ids.find(h => element === `button-${h}`)
   if (id === undefined || typeof data !== 'object' || data === null || Array.isArray(data)) return undefined
   const m = data as Record<string, unknown>
@@ -817,6 +913,9 @@ async function shellActivity($: EngineInterface, before: Snapshot, result: ToolC
   }
   const seen = new Set(folderIds.map(id => paths.key(id)))
   const ids = [...folderIds, ...gitIds.filter(id => !seen.has(paths.key(id)))].slice(0, SCAN_LIT_LIMIT)
+  // Folders the command made are not files Claude changed (spec-10 R2.1).
+  const folders = new Set((await read($, treeAtom)).nodes.filter(n => n.kind === 'dir').map(n => n.id))
+  await noteFiles($, 'write', ids.filter(id => !folders.has(id)))
   if (settings.writes && ids.length > 0) {
     const listed = new Set<string>()
     for (const id of gitIds) if (ids.includes(id) && !(await uncover($, id, gen, true, listed))) return
@@ -855,6 +954,7 @@ async function flash($: EngineInterface, ids: readonly string[], tone: Tone, gen
   })
   if (lit === null) return
   const next: ActivityState = lit
+  if (settings.follow && lastSurface === 'terminal') await update($, touchedAtom, s => (s.show ? { ...s, scroll: null } : s))
   await update($, activityAtom, () => next)
   endGlowIn($, FLASH_MS)
 }
@@ -897,13 +997,17 @@ async function endGlow($: EngineInterface, seq: number) {
   // The window freezes where the glow left it (R7.2); before the clear, so no redraw recentres it first.
   if (settings.follow && lastSurface === 'terminal') {
     await update($, treeAtom, t => (t.scroll === null ? { ...t, scroll: view.from } : t))
+    await update($, touchedAtom, s => (s.show && s.scroll === null ? { ...s, scroll: touchedView.from } : s))
   }
   await update($, activityAtom, () => emptyActivity())
 }
 
 async function observe($: EngineInterface, e: ToolCallInput, result: ToolCallResult, before: Snapshot | null) {
   const t = await read($, treeAtom)
-  const touch = touchOf(e, result, { paths, cwd: await cwd($), home, root: t.root })
+  const at = await cwd($)
+  // The lists keep what Claude touched whatever the tree shows or glows (spec-10 R2.6).
+  await noteTool($, e, result, at, t.root)
+  const touch = touchOf(e, result, { paths, cwd: at, home, root: t.root })
   if (!touch) return
   if (touch.kind === 'read') {
     if (settings.reads) await reveal($, touch.ids, 'read')
@@ -966,7 +1070,8 @@ async function sync($: EngineInterface) {
 
 async function copyPath($: EngineInterface, id: string, mode: 'relative' | 'absolute', surface: RenderSurface) {
   const { root } = await read($, treeAtom)
-  const text = paths.native(mode === 'absolute' ? id : paths.relative(root, id))
+  // A listed file outside the root has no relative path to it (spec-10 R4.3).
+  const text = paths.native(mode === 'absolute' || !paths.inside(root, id) || paths.same(root, id) ? id : paths.relative(root, id))
   const copied = await $.ui.copy({ text, surface }).then(r => r.isCopied, () => false)
   $.ui.toast(copied ? `Copied ${text}` : 'Could not copy the path')
 }
@@ -1031,6 +1136,26 @@ function parseMessage(data: unknown, ids: ReadonlySet<string>): RowsMessage | un
     return { kind: 'scrollTo', fraction: m.fraction }
   }
   return undefined
+}
+
+/** The touched view's drawing: the lists, the window, the header and the footer (spec-10 R1, R3). */
+async function drawTouched($: EngineInterface, e: RenderInput<'Pane', 'terminal' | 'desktop'>, tv: TouchedState, glow: GlowView, chip: GitChip | null) {
+  const t = await read($, treeAtom)
+  const glyphs = glyphSetOf(glyphOption, nerdFont, e.surface)
+  const sel = t.selected
+  const selected = sel === '' ? '' : paths.inside(t.root, sel) && !paths.same(t.root, sel) ? paths.native(paths.relative(t.root, sel)) : paths.pretty(sel, home)
+  const view = { surface: e.surface, bodyColumns: e.props.bodyColumns, bodyRows: e.props.scroll.bodyRows }
+  const layout = layoutTouched(tv, view, paths, { root: t.root, home, glyphs, glow, selected: sel }, selected !== '' || chip !== null)
+  touchedView = { from: layout.from, max: layout.max }
+  const mode = modeOf(await read($, columnsAtom), t.root, column)
+  const header = { glyphs, mode, timeMode: timeModeOf(column), hovered, mention: selection !== 'off' }
+  return renderTouched($, e, paths, t.root, layout, { selected, chip }, header, {
+    nav: k => touchedKey($, { key: k }, e.surface).then(() => $.ui.focus({ requestId: PANE, key: 'nav-o' }).catch(() => undefined)),
+    mention: async () => {
+      const { selected: id } = await read($, treeAtom)
+      if (id !== '') await mention($, id)
+    },
+  })
 }
 
 async function runFiletree($: EngineInterface, e: CommandRunInput): Promise<CommandRunResult> {
@@ -1181,6 +1306,8 @@ export const register: Register = (on, options) => {
     const git = g.root === t.root ? { state: g, hints } : null
     const c = await read($, chipAtom)
     const chip = c !== null && c.root === t.root && now - c.at < CHIP_MS ? c : null
+    const tv = await read($, touchedAtom)
+    if (tv.show) return drawTouched($, e, tv, glow, chip)
     const { query } = await read($, searchAtom)
     const keep = filterOf(paths, t, termOf(query))
     const cs = await read($, columnsAtom)
@@ -1210,7 +1337,7 @@ export const register: Register = (on, options) => {
   on('ui.message', { requestId: PANE }, async ($, e, next) => {
     const pv = await read($, previewAtom)
     if (typeof e.element === 'string' && e.element.startsWith('button-')) {
-      const msg = parseButton(e.element, e.data, pv.id !== '')
+      const msg = parseButton(e.element, e.data, pv.id !== '', (await read($, touchedAtom)).show)
       if (!msg) return {}
       if ('press' in msg) {
         if (msg.id === 'external') await openInApp($, pv.id)
@@ -1224,11 +1351,22 @@ export const register: Register = (on, options) => {
     }
     if (e.element !== 'rows') return next(e)
     const t = await read($, treeAtom)
-    const msg = parseMessage(e.data, new Set(t.nodes.map(n => n.id)))
+    const tv = await read($, touchedAtom)
+    // In the touched view a press names a listed file, never a tree row (spec-10 R4.4).
+    const ids = tv.show && pv.id === '' ? listedIds(tv) : t.nodes.map(n => n.id)
+    const msg = parseMessage(e.data, new Set(ids))
     if (!msg) return {}
     // While the preview shows, only its keys count; presses and the scrollbar have no rows to act on (spec-08 R6.1).
     if (pv.id !== '') {
       if (msg.kind === 'key') await previewKey($, msg.key)
+      return {}
+    }
+    if (tv.show) {
+      await touchedMessage($, msg, e.surface)
+      return {}
+    }
+    if (msg.kind === 'key' && msg.key === 't' && !msg.ctrl) {
+      await toggleTouched($)
       return {}
     }
     if (msg.kind === 'key' && msg.key === 'a' && !msg.ctrl) {
@@ -1246,6 +1384,11 @@ export const register: Register = (on, options) => {
     // The wheel scrolls the preview while it shows (spec-08 R6.3).
     if ((await read($, previewAtom)).id !== '') {
       await movePreview($, (top, total, rows) => clampTop(top + step, total, rows))
+      return {}
+    }
+    if ((await read($, touchedAtom)).show) {
+      const at = Math.max(0, Math.min(touchedView.max, touchedView.from + step))
+      await update($, touchedAtom, s => ({ ...s, scroll: at }))
       return {}
     }
     const scroll = Math.max(0, Math.min(view.max, view.from + step))

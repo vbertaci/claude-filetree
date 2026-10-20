@@ -194,7 +194,7 @@ A `spec-01` não chama nenhum executável.
 
 ## Data models
 
-O contrato de estado fica em `types/index.d.ts`, declarado em `interface PluginState` sob `'filetree-local'`. Cada fatia acrescenta as suas chaves. A `spec-01` define `tree` e `memory`, a `spec-02` define `activity`, a `spec-03` define `git`, a `spec-04` define `chip`, a `spec-06` define `search` e a `spec-07` define `columns`.
+O contrato de estado fica em `types/index.d.ts`, declarado em `interface PluginState` sob `'filetree-local'`. Cada fatia acrescenta as suas chaves. A `spec-01` define `tree` e `memory`, a `spec-02` define `activity`, a `spec-03` define `git`, a `spec-04` define `chip`, a `spec-06` define `search`, a `spec-07` define `columns`, a `spec-08` define `preview` e a `spec-10` define `touched`.
 
 ## Key decisions
 
@@ -224,6 +224,7 @@ O contrato de estado fica em `types/index.d.ts`, declarado em `interface PluginS
 | `spec-07` | Colunas e visual | tamanhos (`Σ`), idade, opção `column`, glyphs Nerd Font (`glyphs`, com `auto` por listagem das pastas de fontes), dicas de hover nos botões, realce da linha sob o mouse | R1.9 (`WINDIR`, `LOCALAPPDATA`) |
 | `spec-08` | Abrir, preview e edição | abrir com app padrão, preview no painel, opções `open` e `edit` | R1.1, R1.2 (`explorer.exe`), R1.5, R1.6 |
 | `spec-09` | Contexto da seleção | seleção como contexto do prompt, `@menções` revelam arquivos | R1.4 |
+| `spec-10` | Arquivos tocados pelo Claude | não existe no original: visão só com os arquivos que o Claude alterou e leu, `clean` e clique que tira da lista, para projetos grandes demais para a árvore | R1.7 |
 
 Funcionalidades do original que **não** serão portadas:
 

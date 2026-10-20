@@ -1,12 +1,13 @@
 import type { EngineInterface, RenderElement, RenderInput } from 'claude-code'
 
-import type { ButtonProps, GitChip, GitLetter, GitState, Glow, RowSpec, RowsProps, Seg, ThemeKeyName, Tone, TreeState } from '../types'
+import type { ButtonProps, FileNode, GitChip, GitLetter, GitState, Glow, RowSpec, RowsProps, Seg, ThemeKeyName, Tone, TouchedState, TreeState } from '../types'
 import { type ColumnMode, cellText, widthOf } from './columns'
 import { isMarkdown, windowLines } from './open'
 import { BRANCH_ID, type NodeGit, gitOf } from './git'
 import { type GlyphSet, LABELS, caret, chipIcon, cols, nodeGlyph, take } from './icons'
 import type { Paths } from './os'
 import { termOf } from './search'
+import { READ_ID, WRITTEN_ID } from './touched'
 import { type Row, visibleRows, windowOf } from './tree'
 
 export const DESKTOP_ROW_CAP = 1500
@@ -20,8 +21,12 @@ const MIN_NAME = 12
 const MIN_TITLE = 8
 
 /** The header buttons, each a Client of its own, in the order they show (spec-07 R5.1). */
-export const HEADER_IDS = ['up', 'cwd', 'refresh', 'hidden', 'size', 'collapse', 'unselect'] as const
+export const HEADER_IDS = ['up', 'cwd', 'refresh', 'hidden', 'size', 'collapse', 'touched', 'unselect'] as const
 export type HeaderId = (typeof HEADER_IDS)[number]
+
+/** The header buttons of the touched view, in the order they show (spec-10 R1.2, R5.1). */
+export const TOUCHED_IDS = ['touched', 'clean'] as const
+export type TouchedId = (typeof TOUCHED_IDS)[number]
 
 /** What glows while a glow is live; `focus` is null when follow is off. */
 export type GlowView = { lit: Record<string, Glow>; focus: string | null } | null
@@ -299,6 +304,7 @@ function headerButtons(t: TreeState, look: HeaderLook): HeaderButton[] {
     },
     { id: 'size', label: L.size, dim: !sizeOn, hint: !sizeOn ? 'show sizes' : look.timeMode === 'age' ? 'show ages' : 'show dates' },
     { id: 'collapse', label: L.collapse, dim: false, hint: 'collapse all' },
+    { id: 'touched', label: L.touched, dim: true, hint: 'files Claude touched' },
     ...(t.selected !== '' ? [{ id: 'unselect' as const, label: L.unselect, dim: false, hint: 'clear selection' }] : []),
   ]
 }
@@ -473,29 +479,193 @@ export function renderPane(
       ) : (
         <Client key="rows" module="./rows.tsx" props={layout.props} />
       )}
-      {(t.selected !== '' || chip !== null) && (
-        <Box flexDirection="row">
-          {/* The selection reaches the prompt box only when the person asks, in plain sight (spec-09 R2.2). */}
-          {t.selected !== '' && look.mention && (
-            <Box flexShrink={0} marginRight={1}>
-              <Button key="mention" plain dimColor onPress={actions.mention}>{L.mention}</Button>
-            </Box>
-          )}
-          <Box flexGrow={1} flexShrink={1} overflow="hidden">
-            {t.selected !== '' && (
-              <Text color="subtle" wrap="truncate-start">
-                selected: {paths.native(paths.relative(t.root, t.selected))}
-              </Text>
-            )}
-          </Box>
-          {chip !== null && (
-            <Box flexDirection="row" flexShrink={0} marginLeft={2}>
-              <Text color={TONE_COLOR[chip.tone]}>{`${chipIcon(look.glyphs, chip.icon)} ${chip.text}`}</Text>
-              {chip.detail !== '' && <Text color="subtle">{` ${chip.detail}`}</Text>}
-            </Box>
-          )}
+      {footer($, e, t.selected !== '' ? paths.native(paths.relative(t.root, t.selected)) : '', chip, look, actions.mention)}
+    </Box>
+  )
+}
+
+/** The selection and the chip under the rows; null with neither (spec-01, spec-04 R5, spec-09 R2.2). */
+function footer(
+  $: EngineInterface,
+  e: RenderInput<'Pane', 'terminal' | 'desktop'>,
+  selected: string,
+  chip: GitChip | null,
+  look: { glyphs: GlyphSet; mention: boolean },
+  mention: () => Promise<unknown>,
+): RenderElement | null {
+  if (selected === '' && chip === null) return null
+  const { Box, Text, Button } = $.ui.resolve(e)
+  return (
+    <Box flexDirection="row">
+      {/* The selection reaches the prompt box only when the person asks, in plain sight (spec-09 R2.2). */}
+      {selected !== '' && look.mention && (
+        <Box flexShrink={0} marginRight={1}>
+          <Button key="mention" plain dimColor onPress={mention}>{LABELS[look.glyphs].mention}</Button>
         </Box>
       )}
+      <Box flexGrow={1} flexShrink={1} overflow="hidden">
+        {selected !== '' && (
+          <Text color="subtle" wrap="truncate-start">
+            selected: {selected}
+          </Text>
+        )}
+      </Box>
+      {chip !== null && (
+        <Box flexDirection="row" flexShrink={0} marginLeft={2}>
+          <Text color={TONE_COLOR[chip.tone]}>{`${chipIcon(look.glyphs, chip.icon)} ${chip.text}`}</Text>
+          {chip.detail !== '' && <Text color="subtle">{` ${chip.detail}`}</Text>}
+        </Box>
+      )}
+    </Box>
+  )
+}
+
+/** A row of the touched view: a section's title or a listed file (spec-10 R3). */
+type TouchedLine = { id: string; tone: 'write' | 'read'; count?: number }
+
+export type TouchedLayout = { from: number; max: number; room: number; props: RowsProps }
+
+/** What a file row draws besides its name: the folder it is in, the glyphs, the glow (spec-10 R3.3). */
+export type TouchedLook = { root: string; home: string; glyphs: GlyphSet; glow: GlowView; selected: string }
+
+const takeEnd = (s: string, n: number): string => [...s].slice(-Math.max(1, n)).join('')
+
+/** Where a listed file is: relative to the root inside it, '' at the root, else pretty (spec-10 R3.3). */
+function folderOf(paths: Paths, id: string, root: string, home: string): string {
+  const dir = paths.parent(id)
+  if (dir === null || paths.same(dir, root)) return ''
+  return paths.inside(root, dir) ? paths.native(paths.relative(root, dir)) : paths.pretty(dir, home)
+}
+
+function touchedSpec(paths: Paths, line: TouchedLine, s: TouchedState, total: number, look: TouchedLook): RowSpec {
+  const color = TONE_COLOR[line.tone]
+  if (line.count !== undefined) {
+    const title = line.tone === 'write' ? 'changed' : 'read'
+    const count = ` ${line.count}`
+    return {
+      id: line.id,
+      segs: [
+        { text: title, color, bold: true },
+        { text: count + ' '.repeat(Math.max(0, total - cols(title) - cols(count))), color: 'subtle' },
+      ],
+      active: false,
+    }
+  }
+  const name = paths.base(line.id)
+  const node: FileNode = { id: line.id, parent: '', name, kind: 'file', hidden: false, mtimeMs: 0, size: 0, loaded: false }
+  const lead = `  ${nodeGlyph(look.glyphs, node, false, false)} `
+  const room = Math.max(1, total - cols(lead))
+  const shown = cols(name) > room ? `${take(name, room - 1)}…` : name
+  const rest = room - cols(shown)
+  const dir = folderOf(paths, line.id, look.root, look.home)
+  // The folder gives way first, from its start, so the part next to the file stays (spec-10 R3.3).
+  const where = dir === '' || rest < 4 ? '' : cols(dir) + 1 > rest ? ` …${takeEnd(dir, rest - 2)}` : ` ${dir}`
+  const lit = look.glow?.lit[line.id]
+  const isSelected = look.selected !== '' && paths.same(look.selected, line.id)
+  const nameSeg: Seg = lit
+    ? { text: shown, color: TONE_COLOR[lit.tone], glow: lit.faint ? 'faint' : 'bright' }
+    : { text: shown, color, ...(isSelected ? { bold: true as const } : {}) }
+  const tail = where + ' '.repeat(Math.max(0, rest - cols(where)))
+  return {
+    id: line.id,
+    segs: [{ text: lead, color: 'subtle' }, nameSeg, ...(tail !== '' ? [{ text: tail, color: 'subtle' as const }] : [])],
+    active: s.cursor !== '' && line.id === s.cursor,
+  }
+}
+
+/** The touched view's rows: changed on top, read below, each under its title; the terminal gets a window (spec-10 R3). */
+export function layoutTouched(
+  s: TouchedState,
+  view: { surface: string; bodyColumns: number; bodyRows: number },
+  paths: Paths,
+  look: TouchedLook,
+  footerShows: boolean,
+): TouchedLayout {
+  const lines: TouchedLine[] = []
+  if (s.written.length > 0) lines.push({ id: WRITTEN_ID, tone: 'write', count: s.written.length }, ...s.written.map(id => ({ id, tone: 'write' as const })))
+  if (s.read.length > 0) lines.push({ id: READ_ID, tone: 'read', count: s.read.length }, ...s.read.map(id => ({ id, tone: 'read' as const })))
+  const total = Math.max(1, view.bodyColumns)
+  const empty = lines.length === 0 ? 'nothing read or changed yet' : null
+  if (view.surface !== 'terminal') {
+    return { from: 0, max: 0, room: lines.length, props: { rows: lines.map(l => touchedSpec(paths, l, s, total, look)), bar: null, empty, more: 0 } }
+  }
+  const room = Math.max(5, view.bodyRows - 2 - (footerShows ? 1 : 0))
+  // While following, the automatic window centres on what Claude touched, as the tree does (spec-02 R7.1).
+  const isFile = (l: TouchedLine) => l.count === undefined
+  const focus = look.glow?.focus ? lines.findIndex(l => isFile(l) && l.id === look.glow?.focus) : -1
+  const cursorIndex = focus >= 0 ? focus : lines.findIndex(l => isFile(l) && l.id === s.cursor)
+  const { from, max } = windowOf(lines.length, cursorIndex, room, s.scroll)
+  const bar = lines.length > room ? 1 : 0
+  const thumbSize = Math.max(1, Math.round((room * room) / Math.max(1, lines.length)))
+  return {
+    from,
+    max,
+    room,
+    props: {
+      rows: lines.slice(from, from + room).map(l => touchedSpec(paths, l, s, total - bar, look)),
+      bar: bar ? { thumbFrom: max === 0 ? 0 : Math.round((from / max) * (room - thumbSize)), thumbSize } : null,
+      empty,
+      more: 0,
+    },
+  }
+}
+
+export type TouchedActions = {
+  nav: (key: 'down' | 'up' | 'return') => Promise<unknown>
+  mention: () => Promise<unknown>
+}
+
+/** The touched view in place of the tree: its header, its nav row, the lists and the footer (spec-10 R1, R3, R5). */
+export function renderTouched(
+  $: EngineInterface,
+  e: RenderInput<'Pane', 'terminal' | 'desktop'>,
+  paths: Paths,
+  root: string,
+  layout: TouchedLayout,
+  below: { selected: string; chip: GitChip | null },
+  look: HeaderLook,
+  actions: TouchedActions,
+): RenderElement {
+  const { Box, Text, Button, Client } = $.ui.resolve(e)
+  const L = LABELS[look.glyphs]
+  const buttons: (ButtonProps & { id: TouchedId; hint: string })[] = [
+    { id: 'touched', label: L.touched, dim: false, hint: 'back to the tree' },
+    { id: 'clean', label: L.clean, dim: layout.props.empty !== null, hint: 'clear the lists' },
+  ]
+  const hint = hintOf(buttons, look.hovered, e.props.bodyColumns)
+  return (
+    <Box flexDirection="column">
+      <Box flexDirection="row">
+        <Box flexDirection="row" flexGrow={1} flexShrink={1} overflow="hidden">
+          <Box flexShrink={1} overflow="hidden">
+            <Text color="suggestion" weight="bold" wrap="truncate-start">
+              {rootLabel(paths, root)}
+            </Text>
+          </Box>
+          <Box flexShrink={2} overflow="hidden">
+            <Text color="subtle" wrap="truncate-end">
+              {' · touched by Claude'}
+            </Text>
+          </Box>
+        </Box>
+        {hint !== '' && <Text color="subtle">{`${hint} `}</Text>}
+        <Box flexDirection="row" flexShrink={0} gap={1}>
+          {buttons.map(b => (
+            <Client key={`button-${b.id}`} module="./button.tsx" props={{ id: b.id, label: b.label, dim: b.dim } satisfies ButtonProps} />
+          ))}
+        </Box>
+      </Box>
+      <Box flexDirection="row" gap={2}>
+        <Button key="nav-j" plain dimColor hotkey="j" onPress={() => actions.nav('down')}>{L['nav-j']}</Button>
+        <Button key="nav-k" plain dimColor hotkey="k" onPress={() => actions.nav('up')}>{L['nav-k']}</Button>
+        <Button key="nav-o" plain dimColor hotkey="o" autoFocus onPress={() => actions.nav('return')}>{L['nav-o']}</Button>
+      </Box>
+      {e.surface === 'terminal' ? (
+        <Client key="rows" module="./rows.tsx" props={layout.props} height={Math.max(1, layout.props.rows.length)} />
+      ) : (
+        <Client key="rows" module="./rows.tsx" props={layout.props} />
+      )}
+      {footer($, e, below.selected, below.chip, look, actions.mention)}
     </Box>
   )
 }

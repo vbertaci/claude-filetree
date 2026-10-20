@@ -2,7 +2,7 @@
 
 Um mod local do Claude Code que mostra uma árvore de arquivos no estilo de IDE num painel lateral: navegação por teclado e mouse, status do git, o que o Claude lê e escreve brilhando na árvore, busca, colunas de data, idade ou tamanho, preview de arquivos e menções `@` no prompt.
 
-- **Versão:** 0.9.0 (as nove fatias do roadmap).
+- **Versão:** 0.10.0 (as nove fatias do roadmap e a visão dos arquivos tocados pelo Claude).
 - **Plataforma:** Windows. A camada de SO (`hooks/os.ts`) deixa o resto pronto para outras plataformas, mas só o Windows é verificado.
 - **Requisitos:** Claude Code 2.1.302 ou mais novo, no layout fullscreen (`/tui fullscreen`), com o terminal de pelo menos 110 colunas. O app desktop encaixa o painel sozinho.
 
@@ -43,6 +43,7 @@ Numa sessão nova, `/plugin` deve listar `filetree-local`. O painel abre ao inic
 | `y` / `Y` | copia o caminho relativo / absoluto | — |
 | `s` | foca a busca | — |
 | `a` | põe `@caminho` da linha do cursor na caixa do prompt | — |
+| `t` | troca a árvore pela visão dos arquivos tocados pelo Claude, e de volta | — |
 | `e` | — | abre no editor (opção `edit`) na linha do topo |
 
 ### Mouse
@@ -57,7 +58,7 @@ Numa sessão nova, `/plugin` deve listar `filetree-local`. O painel abre ao inic
 
 ### Cabeçalho, busca e rodapé
 
-- **Botões:** `↑` pasta-mãe, `⌂` seguir a cwd, `↻` reler árvore e git, `◉`/`○` mostrar/ocultar ocultos, `Σ` alternar tamanhos, `⊟` recolher tudo, `⊘` limpar a seleção.
+- **Botões:** `↑` pasta-mãe, `⌂` seguir a cwd, `↻` reler árvore e git, `◉`/`○` mostrar/ocultar ocultos, `Σ` alternar tamanhos, `⊟` recolher tudo, `✎` arquivos tocados pelo Claude, `⊘` limpar a seleção.
 - **Linha da branch:** branch, upstream, ahead/behind e o total `+N -N` da raiz. Fora de um repositório, uma dica (opção `hints`).
 - **Busca:** filtra a árvore enquanto você digita, inclusive em pastas ainda fechadas (`git ls-files`, ou varredura por `fs.list` fora de um repositório). `Enter` pula para o primeiro resultado; `×` limpa.
 - **Rodapé:** `@` (menciona o selecionado no prompt), `selected: <caminho>` e o chip da última ação de git (`committed <sha>`, `pushed`, `staged N`…).
@@ -74,6 +75,15 @@ Numa sessão nova, `/plugin` deve listar `filetree-local`. O painel abre ao inic
 - **App padrão** (`open: app`): duplo clique ou `Enter` abrem o arquivo no programa associado do Windows, por `%WINDIR%\explorer.exe <caminho>`. Programas e scripts (`.exe`, `.bat`, `.ps1`, `.lnk`, `.url`, `.js`, `.msi`…) **nunca** são executados, nem por um link que leve a eles; caminhos com vírgula e de rede também são recusados, com um aviso.
 - **Preview** (`open: preview`): o arquivo aparece no painel, Markdown desenhado e código com cores e números de linha. Só lê arquivos cujo caminho real (links resolvidos) fica dentro do caminho real da cwd; os outros mostram uma nota, e `↗` os abre no app padrão. Arquivos acima de 4 MiB, binários e ilegíveis também mostram uma nota.
 - **Editor** (`edit`): `e` no preview abre o arquivo na linha do topo por um link `vscode://`, `vscode-insiders://` ou `cursor://`, entregue pelo `explorer.exe`.
+
+### Arquivos tocados pelo Claude
+
+Num projeto com arquivos demais para a árvore, `✎` no cabeçalho (ou `t`) troca a árvore por uma visão só com o que o Claude mexeu nesta sessão:
+
+- **changed** no topo: arquivos alterados por `Edit`, `Write`, `NotebookEdit` ou um comando de shell; **read** logo abaixo: arquivos lidos por `Read` ou `Grep` (`Glob` não conta). O mais recente primeiro; um arquivo lido e depois alterado fica só em changed.
+- **Clique** num arquivo: seleciona (como na árvore) e o tira da lista. `Enter` ou `Ctrl`/`Shift` + clique também o abrem, conforme a opção `open`. Clique direito copia o caminho e o mantém na lista.
+- **`clean`** esvazia as duas listas, só para limpar a visão: nada de commit, git ou arquivo.
+- A visão não lista pastas nem roda git, então é leve em qualquer tamanho de projeto. Cada lista guarda até 200 arquivos, e as listas sobrevivem a um reload do mod.
 
 ### Seleção no prompt
 
@@ -116,16 +126,17 @@ Um único módulo de entrada registra os hooks e delega a módulos puros, testá
 | `hooks/icons.ts` | glyphs, rótulos e largura em pontos de código |
 | `hooks/open.ts` | opções de abrir/editar, recusas, link do editor, preparação e janela do preview |
 | `hooks/selection.ts` | referência, menção e linha acrescentada da seleção |
-| `hooks/pane.tsx` | estado → árvore de elementos (painel e preview) |
+| `hooks/touched.ts` | listas de arquivos alterados e lidos pelo Claude, e as teclas delas |
+| `hooks/pane.tsx` | estado → árvore de elementos (painel, preview e visão dos arquivos tocados) |
 | `hooks/rows.tsx`, `hooks/button.tsx` | Clients: linhas, preview, botões com hover |
-| `types/index.d.ts` | contrato de `$.state` (`tree`, `memory`, `activity`, `git`, `chip`, `search`, `columns`, `preview`) |
+| `types/index.d.ts` | contrato de `$.state` (`tree`, `memory`, `activity`, `git`, `chip`, `search`, `columns`, `preview`, `touched`) |
 
 ## Desenvolvimento
 
 ```powershell
 claude plugin validate .   # manifesto, hooks, chamadas, env e estado
 tsc -p .                   # tipos (npm install -g typescript; só ferramenta de desenvolvimento)
-claude plugin test .       # 282 testes, nas superfícies terminal e desktop
+claude plugin test .       # 317 testes, nas superfícies terminal e desktop
 ```
 
 O repositório não tem dependências de runtime nem `package.json`. Os testes ficam em `tests/`; `tests/world.ts` e o início de `tests/pane.test.tsx` simulam uma máquina Windows por baixo do plugin (pastas, textos, links, git, `explorer.exe`, caixa do prompt).
