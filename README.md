@@ -2,8 +2,6 @@
 
 Um mod local do Claude Code que mostra uma árvore de arquivos no estilo de IDE num painel lateral: navegação por teclado e mouse, status do git, o que o Claude lê e escreve brilhando na árvore, busca, colunas de data, idade ou tamanho, preview de arquivos e menções `@` no prompt.
 
-É uma reescrita independente do mod [`claude-code-filetree`](https://github.com/data-goblin/claude-code-filetree) (v0.2.26), feita para rodar só código que o autor entende e controla: sem shell, sem marketplace, sem atualização automática e sem nada escondido no prompt. O comportamento do original foi a especificação; o código não foi copiado.
-
 - **Versão:** 0.9.0 (as nove fatias do roadmap).
 - **Plataforma:** Windows. A camada de SO (`hooks/os.ts`) deixa o resto pronto para outras plataformas, mas só o Windows é verificado.
 - **Requisitos:** Claude Code 2.1.302 ou mais novo, no layout fullscreen (`/tui fullscreen`), com o terminal de pelo menos 110 colunas. O app desktop encaixa o painel sozinho.
@@ -102,21 +100,6 @@ Em `/plugin` → `filetree-local` → configurar.
 | `edit` | `off`, `vscode`, `vscode-insiders`, `cursor` | o editor do `e` no preview |
 | `selection` | `mention`, `append`, `off` | como a seleção chega ao prompt, sempre à vista |
 
-## Regras de segurança
-
-Estas regras (spec-00 R1) diferenciam o mod do original e são conferidas na saída de `claude plugin validate` e nos testes:
-
-| Regra | Como é garantida |
-|---|---|
-| Nenhum shell (`sh`, `bash`, `cmd`, `powershell`, `pwsh`) | os únicos `argv[0]` são `git.exe` e `%WINDIR%\explorer.exe` por caminho absoluto |
-| Só executáveis da lista | `git.exe` (só subcomandos de leitura, com `--no-optional-locks -c core.fsmonitor=false`) e `explorer.exe` com um único argumento |
-| `tool.call` só observa | o hook repassa o mesmo `e` e devolve o mesmo resultado |
-| Nada invisível no prompt | `e.context` nunca é usado; a única mudança de texto é a linha opcional de `selection: append`, que aparece na mensagem |
-| Leitura só dentro do projeto | `$.fs.read` só em `loadPreview`, e só do caminho real dentro do caminho real da cwd |
-| Sem escrita em disco, rede, modelos ou ferramentas | nenhuma chamada a `fs.write`, `store`, `http`, `model`, `agent` ou `tool.register` |
-| Variáveis de ambiente da lista | `OS`, `USERPROFILE`, `HOME`, `WINDIR`, `LOCALAPPDATA` |
-| Sem atualização automática | carregado de uma pasta local versionada, sem marketplace |
-
 ## Arquitetura
 
 Um único módulo de entrada registra os hooks e delega a módulos puros, testáveis sem o engine.
@@ -146,47 +129,3 @@ claude plugin test .       # 282 testes, nas superfícies terminal e desktop
 ```
 
 O repositório não tem dependências de runtime nem `package.json`. Os testes ficam em `tests/`; `tests/world.ts` e o início de `tests/pane.test.tsx` simulam uma máquina Windows por baixo do plugin (pastas, textos, links, git, `explorer.exe`, caixa do prompt).
-
-## Especificações
-
-Cada fatia tem a sua spec em `.workbench/work-items/20261016-filetree-local/`:
-
-| Spec | Fatia |
-|---|---|
-| `spec-00-overview.md` | visão geral, regras globais (R1–R4), camada de SO, roadmap |
-| `spec-01-pane-tree-navigation.md` | painel, árvore e navegação |
-| `spec-02-claude-activity.md` | atividade do Claude |
-| `spec-03-git-status.md` | status do git |
-| `spec-04-git-activity.md` | atividade de git (chips, verde, linha da branch) |
-| `spec-05-auto-refresh.md` | atualização automática |
-| `spec-06-search.md` | busca |
-| `spec-07-columns-and-look.md` | colunas, glyphs e hover |
-| `spec-08-open-preview-edit.md` | abrir com o app padrão, preview e edição |
-| `spec-09-selection-context.md` | seleção no prompt e `@menções` |
-
-## Diferenças do original
-
-| Original | Aqui | Por quê |
-|---|---|---|
-| abre arquivos com `powershell -Command` | `%WINDIR%\explorer.exe <caminho>` | sem shell |
-| "Open with" aceita qualquer comando | `edit` com uma lista fechada de editores por link | sem execução arbitrária |
-| duplo clique abre qualquer arquivo | programas e scripts recusados | um clique não executa código do projeto |
-| preview lê qualquer arquivo da árvore | só dentro da cwd, pelo caminho real | a árvore pode estar em `C:\` |
-| seleção vai em `e.context`, invisível | menção na caixa do prompt ou linha visível | nada escondido do usuário |
-| `@menções` por expressão regular | pelo `prompt.mention` do engine | usa o que o engine resolveu e anexou |
-| caminhos comparados diferenciando maiúsculas | sem diferenciar no Windows | `C:\Devs` e `c:\devs` são a mesma pasta |
-| detecção de Nerd Font por `sh -c` | listagem das pastas de fontes do Windows | sem shell, e funciona no Windows |
-| marketplace com atualização automática | pasta local | nenhum canal de atualização de terceiros |
-
-Não portados: Quick Look (macOS), editor via tmux/herdr, tema Omarchy, editores de terminal (`$VISUAL`/`$EDITOR`).
-
-## Verificação manual pendente
-
-Os testes cobrem os critérios de aceitação; estes pontos dependem do Windows real e ficam para a revisão do autor:
-
-1. Duplo clique num `.md` e num `.png` abre os apps padrão; num `.bat`, só o aviso (spec-08 A1).
-2. Com `edit: vscode`, `e` no preview abre o VS Code na linha mostrada (spec-08 A2).
-3. O foco vai a `back`/`edit` ao abrir o preview e volta a `open` ao fechar (spec-08 R6.4).
-4. `a` põe `@caminho ` na caixa do prompt, e `@"caminho com espaço"` é entendido como menção (spec-09 A1).
-5. Com `selection: append`, a linha aparece no fim da mensagem na transcrição (spec-09 A2).
-6. Ícones Nerd Font alinhados e realce de linha legível (spec-07 A1, A2).
